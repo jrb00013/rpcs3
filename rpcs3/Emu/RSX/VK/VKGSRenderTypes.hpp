@@ -328,18 +328,26 @@ namespace vk
 
 		inline command_buffer_chunk* next()
 		{
-			const auto result_id = ++m_current_index % Count;
-			auto result = &m_cb_list[result_id];
-
-			if (!result->poke())
+			// Advance once, then prefer any free CB in the ring before blocking.
+			// Upstream returned a still-pending CB when poke() failed — BO2 + MT RSX
+			// flooded the ring and froze presents. Wait only when every slot is busy.
+			for (u32 attempt = 0; attempt < Count; ++attempt)
 			{
-				// GPU fell behind the submit ring. Waiting reclaims this slot safely;
-				// returning a still-pending CB used to corrupt/freeze presents (BO2 SS).
-				rsx_log.warning("CB chain exhausted - waiting for a free entry");
-				result->flush();
-				result->wait();
+				const auto result_id = ++m_current_index % Count;
+				auto result = &m_cb_list[result_id];
+
+				if (result->poke())
+				{
+					return result;
+				}
 			}
 
+			// Entire chain in flight — reclaim the next slot safely.
+			const auto result_id = ++m_current_index % Count;
+			auto result = &m_cb_list[result_id];
+			rsx_log.warning("CB chain exhausted - waiting for a free entry");
+			result->flush();
+			result->wait();
 			return result;
 		}
 
