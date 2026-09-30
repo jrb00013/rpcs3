@@ -191,6 +191,11 @@ hid_pad_handler<Device>::~hid_pad_handler()
 template <class Device>
 bool hid_pad_handler<Device>::Init()
 {
+	// Init() is reachable from the GUI thread, the pad-settings input thread and the
+	// pad threads. Without serialization two threads can both run the first-time setup
+	// and mutate m_controllers concurrently.
+	std::lock_guard devices_lock(m_devices_mutex);
+
 	if (m_is_init)
 		return true;
 
@@ -238,6 +243,8 @@ std::vector<pad_list_entry> hid_pad_handler<Device>::list_devices()
 
 	if (!Init())
 		return pads_list;
+
+	std::lock_guard devices_lock(m_devices_mutex);
 
 	for (const auto& controller : m_controllers) // Controllers 1-n in GUI
 	{
@@ -339,6 +346,10 @@ void hid_pad_handler<Device>::enumerate_devices()
 template <class Device>
 void hid_pad_handler<Device>::update_devices()
 {
+	// Replaces entries of m_controllers and walks the whole map. Must not overlap with
+	// Init(), list_devices() or get_hid_device() on another thread.
+	std::lock_guard devices_lock(m_devices_mutex);
+
 	{
 		std::lock_guard lock(m_enumeration_mutex);
 
@@ -444,6 +455,8 @@ std::shared_ptr<Device> hid_pad_handler<Device>::get_hid_device(const std::strin
 {
 	if (!Init())
 		return nullptr;
+
+	std::lock_guard devices_lock(m_devices_mutex);
 
 	// Controllers 1-n in GUI
 	if (auto it = m_controllers.find(padId); it != m_controllers.end())
