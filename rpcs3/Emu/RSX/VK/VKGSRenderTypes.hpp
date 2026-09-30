@@ -333,7 +333,11 @@ namespace vk
 
 			if (!result->poke())
 			{
-				rsx_log.error("CB chain has run out of free entries!");
+				// GPU fell behind the submit ring. Waiting reclaims this slot safely;
+				returning a still-pending CB used to corrupt/freeze presents (BO2 SS).
+				rsx_log.warning("CB chain exhausted — waiting for a free entry");
+				result->flush();
+				result->wait();
 			}
 
 			return result;
