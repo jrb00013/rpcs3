@@ -22,8 +22,9 @@
 #define VK_FRAGMENT_CONSTANTS_BUFFER_SIZE_M 16
 #define VK_INDEX_RING_BUFFER_SIZE_M 16
 
-// Primary/secondary submit rings. 1024 gives BO2 + Multithreaded RSX headroom
-// so next() rarely blocks; the wait path below still prevents present freezes.
+// Primary/secondary submit rings. Sized for heavy present load: Multithreaded
+// RSX + multi-pad co-play (split-screen / friends) so next() rarely blocks.
+// The reclaim path below still refuses to reuse a still-pending CB.
 #define VK_MAX_ASYNC_CB_COUNT 1024
 
 #define FRAME_PRESENT_TIMEOUT 10000000ull // 10 seconds
@@ -331,8 +332,9 @@ namespace vk
 		inline command_buffer_chunk* next()
 		{
 			// Prefer any free CB in the ring before blocking.
-			// Upstream returned a still-pending CB when poke() failed — BO2 + MT RSX
-			// flooded the ring and froze presents. Wait only when every slot is busy.
+			// Upstream returned a still-pending CB when poke() failed — under
+			// Multithreaded RSX + heavy present (co-op / split-screen / multi-pad)
+			// that corrupted the present surface. Wait only when every slot is busy.
 			for (u32 attempt = 0; attempt < Count; ++attempt)
 			{
 				const auto result_id = ++m_current_index % Count;
