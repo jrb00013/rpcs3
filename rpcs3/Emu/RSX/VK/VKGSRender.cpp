@@ -1017,11 +1017,12 @@ void VKGSRender::on_invalidate_memory_range(const utils::address_range32 &range,
 
 void VKGSRender::on_semaphore_acquire_wait()
 {
-	// Always pump while blocked on nv406e semaphore acquire. Conditional pumping
-	// (flush-pending / async-flip only) starved GPU progress under co-play load
-	// so driver TDR fired with an unmatched semaphore and softlocked present
-	// (MK stuck FPS after `semaphore_acquire has timed out`).
-	do_local_task(rsx::FIFO::state::lock_wait);
+	if (m_flush_requests.pending() ||
+		(async_flip_requested & flip_request::emu_requested) ||
+		(m_queue_status & flush_queue_state::deadlock))
+	{
+		do_local_task(rsx::FIFO::state::lock_wait);
+	}
 }
 
 bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
