@@ -336,6 +336,14 @@ jobs:
         shell: pwsh
         run: build\lib\Release-x64\rpcs3_test.exe
 
+      - name: Upload debug symbols (PDB)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 Windows MSVC PDB
+          path: ./bin/rpcs3.pdb
+          compression-level: 6
+          if-no-files-found: warn
+
       - name: Pack up build artifacts
         run: |
           mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
