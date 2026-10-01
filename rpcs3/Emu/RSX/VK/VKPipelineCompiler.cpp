@@ -271,15 +271,9 @@ namespace vk
 			// shader bursts queued longer than necessary.
 			const auto hw_threads = utils::get_thread_count();
 
-			if (hw_threads >= 24)
-			{
-				num_worker_threads = 12;
-			}
-			else if (hw_threads >= 16)
-			{
-				num_worker_threads = 8;
-			}
-			else if (hw_threads > 12)
+			// couchlink: cap at 6. 12 concurrent vkCreateGraphicsPipelines calls stalled the
+			// interpreter precompile on a 24-thread CPU (NVIDIA), freezing boot at "Building base variant N of M".
+			if (hw_threads > 12)
 			{
 				num_worker_threads = 6;
 			}

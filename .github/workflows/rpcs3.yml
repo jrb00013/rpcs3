@@ -338,6 +338,14 @@ jobs:
         shell: pwsh
         run: msbuild rpcs3.sln /p:Configuration=Release /v:minimal /p:Platform=x64 /p:PreferredToolArchitecture=x64 /p:CLToolPath=${{ env.CCACHE_BIN_DIR }} /p:UseMultiToolTask=true /p:CustomAfterMicrosoftCommonTargets="${{ github.workspace }}\buildfiles\msvc\ci_only.targets"
 
+      - name: Upload debug symbols (PDB)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 Windows MSVC PDB
+          path: ./bin/rpcs3.pdb
+          compression-level: 6
+          if-no-files-found: warn
+
       - name: Pack up build artifacts
         run: |
           mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
