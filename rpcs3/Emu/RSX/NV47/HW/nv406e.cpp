@@ -50,6 +50,7 @@ namespace rsx
 
 			u64 start = get_system_time();
 			u64 last_check_val = start;
+			u32 recovery_passes = 0;
 
 			while (sema != arg)
 			{
@@ -75,9 +76,21 @@ namespace rsx
 
 					if ((current - start) > tdr)
 					{
-						// If longer than driver timeout force exit
-						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
-						break;
+						// Upstream aborts here (`break`) with sema still != arg. Under co-play load
+						// (shader compile + WGC capture + CB reclaim) that unmatched acquire
+						// softlocks present: stuck FPS, runaway usleep (MK BLUS30522 @ 0x40300FE0).
+						// Recover and keep waiting — never leave the FIFO with a failed acquire.
+						++recovery_passes;
+						rsx_log.warning("nv406e::semaphore_acquire slow at 0x%X — flush/recover (pass %u)", addr, recovery_passes);
+						RSX(ctx)->on_semaphore_acquire_wait();
+						RSX(ctx)->flush_fifo();
+						if (recovery_passes == 3)
+						{
+							RSX(ctx)->recover_fifo();
+						}
+						start = get_system_time();
+						last_check_val = start;
+						continue;
 					}
 				}
 
