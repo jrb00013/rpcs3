@@ -3383,6 +3383,28 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	return true;
 }
 
+// couchlink: make "PPU Reservation Priority Over SPUs" apply to the PPU lwarx/stwcx. path too.
+// vm::writer_lock already honors it, but a PPU stwcx. that merely loses the race against SPU GETLLAR/PUTLLC on the
+// same 128-byte line never reaches that code and can starve for minutes while SPURS kernels poll (BO2 lobby stalls).
+// When a PPU atomic recently failed on this line, back off ~10 us before touching it so the PPU can complete.
+extern bool ppu_stcx_recently_failed(u32 addr);
+extern atomic_t<u64> g_spu_ppu_prio_backoffs;
+
+static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
+{
+	if (!g_cfg.core.ppu_reservation_priority_over_spu || !addr)
+	{
+		return;
+	}
+
+	if (ppu_stcx_recently_failed(addr))
+	{
+		static const u64 delay = std::max<u64>(utils::get_tsc_freq() / 100000, 1000); // ~10 us
+		g_spu_ppu_prio_backoffs++;
+		utils::busy_wait(delay);
+	}
+}
+
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
 	perf_meter<"PUTLLC-"_u64> perf0;
@@ -4258,6 +4280,7 @@ bool spu_thread::process_mfc_cmd()
 		perf_meter<"GETLLAR"_u64> perf0;
 
 		const u32 addr = ch_mfc_cmd.eal & -128;
+		spu_yield_to_ppu_atomic(addr);
 		const auto& data = vm::_ref<spu_rdata_t>(addr);
 
 		if (addr == last_faddr)
@@ -4624,6 +4647,8 @@ bool spu_thread::process_mfc_cmd()
 
 	case MFC_PUTLLC_CMD:
 	{
+		spu_yield_to_ppu_atomic(raddr);
+
 		// Avoid logging useless commands if there is no reservation
 		const bool dump = g_cfg.core.mfc_debug && raddr;
 

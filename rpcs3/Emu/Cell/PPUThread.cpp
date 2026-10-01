@@ -3543,6 +3543,7 @@ namespace
 	{
 		atomic_t<u32> addr{};
 		atomic_t<u64> count{};
+		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
 	};
 
 	std::array<stcx_fail_slot, 4096> s_stcx_fail;
@@ -3553,7 +3554,21 @@ static inline void note_stcx_fail(u32 addr) noexcept
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 	e.addr.release(addr & -128);
+	e.tsc.release(utils::get_tsc());
 	e.count++;
+}
+
+// Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
+atomic_t<u64> g_spu_ppu_prio_backoffs{};
+
+// True if a PPU stwcx./stdcx. failed on this 128-byte line within the last ~50 us.
+// Used by SPU GETLLAR/PUTLLC to give PPU atomics priority when "PPU Reservation Priority Over SPUs" is on:
+// continuous SPURS polling of a shared line otherwise starves the PPU lwarx/stwcx. retry loop (BO2, issue #3).
+bool ppu_stcx_recently_failed(u32 addr)
+{
+	static const u64 window = std::max<u64>(utils::get_tsc_freq() / 20000, 1000);
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && (utils::get_tsc() - e.tsc.load()) < window;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
@@ -3584,7 +3599,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu; hottest lines:", total);
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
