@@ -1276,14 +1276,67 @@ public:
 		}
 	}
 
+	// couchlink: guest livelock detector (log-only, never changes emulation).
+	// A guest wait loop that polls with sys_timer_usleep and never gets its event shows up as a
+	// sustained, very high usleep rate while FPS/log look "frozen" (seen in BO2 and MK). Dump every
+	// PPU thread's context while it is happening so the stuck PC / waited-on object can be traced.
+	static constexpr u32 s_usleep_syscall = 141;
+	static constexpr u64 s_livelock_rate = 40'000; // calls/s; healthy MK averages ~17k/s, observed stall ~62k/s
+	static constexpr u32 s_livelock_secs = 20;     // sustained for this long before reporting
+	static constexpr u32 s_livelock_max_dumps = 5; // per episode, spaced 60s apart
+
+	void check_livelock(u64& last_usleep, u32& hot_secs, u32& dumps)
+	{
+		const u64 cur = stat[s_usleep_syscall];
+		const u64 rate = cur - std::exchange(last_usleep, cur);
+
+		if (Emu.IsRunning() && rate >= s_livelock_rate)
+		{
+			hot_secs++;
+		}
+		else
+		{
+			if (hot_secs >= s_livelock_secs)
+			{
+				ppu_log.error("PPU livelock episode ended after %us (usleep rate now %llu/s).", hot_secs, rate);
+			}
+
+			hot_secs = 0;
+			dumps = 0;
+			return;
+		}
+
+		if (dumps >= s_livelock_max_dumps || hot_secs < s_livelock_secs || (hot_secs - s_livelock_secs) % 60 != 0)
+		{
+			return;
+		}
+
+		dumps++;
+
+		std::string out;
+		idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& ppu)
+		{
+			fmt::append(out, "\n--- %s (id=0x%x) ---\n", ppu.get_name(), id);
+			ppu.dump_all(out);
+		});
+
+		ppu_log.error("PPU livelock suspected: sys_timer_usleep at %llu/s for %us (dump %u/%u). Guest thread contexts:%s",
+			rate, hot_secs, dumps, s_livelock_max_dumps, out);
+	}
+
 	void operator()()
 	{
 		bool was_paused = false;
 		u64 sleep_until = get_system_time();
+		u64 last_usleep = 0;
+		u32 hot_secs = 0;
+		u32 dumps = 0;
 
 		for (u32 i = 1; thread_ctrl::state() != thread_state::aborting; i++)
 		{
 			thread_ctrl::wait_until(&sleep_until, 1'000'000);
+
+			check_livelock(last_usleep, hot_secs, dumps);
 
 			const bool is_paused = Emu.IsPaused();
 
