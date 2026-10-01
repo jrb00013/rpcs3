@@ -1315,11 +1315,9 @@ void GLGSRender::on_invalidate_memory_range(const utils::address_range32 &range,
 
 void GLGSRender::on_semaphore_acquire_wait()
 {
-	if (!work_queue.empty() ||
-		(async_flip_requested & flip_request::emu_requested))
-	{
-		do_local_task(rsx::FIFO::state::lock_wait);
-	}
+	// Mirror VK: always pump while blocked on nv406e semaphore acquire so
+	// unmatched TDR aborts cannot softlock present under co-play load.
+	do_local_task(rsx::FIFO::state::lock_wait);
 }
 
 void GLGSRender::do_local_task(rsx::FIFO::state state)
