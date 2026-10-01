@@ -3535,6 +3535,65 @@ extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr)
 	return ppu_load_acquire_reservation<u64>(ppu, addr);
 }
 
+// couchlink: stwcx./stdcx. failure histogram per 128-byte reservation line (diagnostics only, no behavior change).
+// PPU atomics can be starved by SPU GETLLAR/PUTLLC polling of the same line (BO2 lobby stalls, issue #3).
+namespace
+{
+	struct stcx_fail_slot
+	{
+		atomic_t<u32> addr{};
+		atomic_t<u64> count{};
+	};
+
+	std::array<stcx_fail_slot, 4096> s_stcx_fail;
+	std::array<u64, 4096> s_stcx_prev{};
+}
+
+static inline void note_stcx_fail(u32 addr) noexcept
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	e.addr.release(addr & -128);
+	e.count++;
+}
+
+u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
+
+// Print the hottest failing lines. Delta since the previous call. Returns total failures in the interval.
+u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
+{
+	std::vector<std::pair<u64, u32>> hot;
+	u64 total = 0;
+
+	for (u32 i = 0; i < s_stcx_fail.size(); i++)
+	{
+		const u64 c = s_stcx_fail[i].count;
+		const u64 d = c - s_stcx_prev[i];
+		s_stcx_prev[i] = c;
+
+		if (d)
+		{
+			total += d;
+			hot.emplace_back(d, static_cast<u32>(s_stcx_fail[i].addr));
+		}
+	}
+
+	if (total < min_total)
+	{
+		return total;
+	}
+
+	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
+
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu; hottest lines:", total);
+
+	for (u32 i = 0; i < top && i < hot.size(); i++)
+	{
+		fmt::append(out, "\n\t0x%08x: %llu", hot[i].second, hot[i].first);
+	}
+
+	return total;
+}
+
 template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
@@ -3589,6 +3648,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 	if (old_data != data || rtime != (res & -128))
 	{
+		note_stcx_fail(addr);
 		ppu.raddr = 0;
 		ppu.res_cached = 0;
 		return false;
@@ -3612,6 +3672,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 			if (!_ok)
 			{
 				// Already locked or updated: give up
+				note_stcx_fail(addr);
 				return false;
 			}
 
@@ -3677,6 +3738,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		// Give up if reservation has been locked or updated
 		if (!_ok)
 		{
+			note_stcx_fail(addr);
 			ppu.last_faddr = 0;
 			return false;
 		}

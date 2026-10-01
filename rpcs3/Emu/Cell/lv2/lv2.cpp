@@ -1239,6 +1239,9 @@ stx::reset_lock acquire_reset_lock(stx::init_mutex& mtx, ppu_thread* ppu)
 	}, ppu);
 }
 
+// couchlink: see PPUThread.cpp
+extern u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
+
 class ppu_syscall_usage
 {
 	// Internal buffer
@@ -1302,7 +1305,18 @@ public:
 			ppu.dump_all(out);
 		});
 
-		ppu_log.error("Guest thread dump requested (dump_threads.trigger): %u PPU threads.%s", count, out);
+		u32 spu_count = 0;
+		idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& spu)
+		{
+			spu_count++;
+			fmt::append(out, "\n--- %s (id=0x%x) ---\n", spu.get_name(), id);
+			spu.dump_all(out);
+		});
+
+		std::string stcx;
+		ppu_report_stcx_failures(stcx, 0, 16);
+
+		ppu_log.error("Guest thread dump requested (dump_threads.trigger): %u PPU threads, %u SPU threads.%s\n\n%s", count, spu_count, out, stcx);
 	}
 
 	void operator()()
@@ -1315,6 +1329,16 @@ public:
 			thread_ctrl::wait_until(&sleep_until, 1'000'000);
 
 			dump_guest_threads_if_requested();
+
+			if (i % 10 == 0)
+			{
+				// Heavy PPU reservation contention shows up here even when nobody triggers a dump.
+				std::string stcx;
+				if (ppu_report_stcx_failures(stcx, 20'000, 4) >= 20'000)
+				{
+					ppu_log.warning("PPU reservation contention: %s", stcx);
+				}
+			}
 
 			const bool is_paused = Emu.IsPaused();
 
