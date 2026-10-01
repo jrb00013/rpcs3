@@ -6,17 +6,25 @@ Release binary that delivers what co-play needs end-to-end.
 ## What this build must deliver
 
 1. **Stay up under co-op present load** — Multithreaded RSX + heavy present
-   (split-screen, multi-pad, friends) must not freeze the present surface.
-   Vulkan CB reclaim/wait instead of reusing a still-pending command buffer.
+   (split-screen, multi-pad, friends) must not *present-freeze*.
+   Vulkan CB reclaim/wait instead of reusing a still-pending command buffer
+   (`CB chain has run out of free entries`).
 2. **Stay up under SPURS pressure** — `sys_spu_thread_send_event` WRCH abort
    must not hang the SPU path (split-screen job spikes).
 3. **Pads stay reliable** — HID pad-handler lock so DualSense/VHID enumerate
    and update without racing the pad thread (GUI / hotplug / friend seats).
-4. **Feel like local** — safe to run **Multithreaded RSX on** + **Frame limit
-   Auto** after this build is staged (last-night stick/present snap).
-5. **Debuggable crashes** — PDB artifact uploaded for symbolication.
-6. **Optimized binary** — CI `Configuration=Release` (MSVC x64), same deploy
+4. **Debuggable crashes** — PDB artifact uploaded for symbolication.
+5. **Optimized binary** — CI `Configuration=Release` (MSVC x64), same deploy
    path as stock Windows builds.
+
+## What this build does *not* fix
+
+**BO2 (BLUS31011) SPURS wait-loop softlocks** with Multithreaded RSX on —
+stuck FPS title, runaway `sys_timer_usleep`, often when opening the in-game
+settings menu. That is separate from Vulkan CB exhaustion. For BO2 keep
+`Multithreaded RSX: false` in the per-game config (see couchlink
+`contrib/rpcs3-bo2-splitscreen`). Stage this binary anyway so present-death
+is covered if MT is ever turned on for experiments.
 
 ## Commits on this line
 
@@ -38,7 +46,7 @@ switch-rpcs3.cmd couchlink-play
 
 (Alias of the staged `20078-cbwait` / this branch artifact.)
 
-Then in the per-game config: `Multithreaded RSX: true`, `Frame limit: Auto`.
+BO2 per-game config: `Multithreaded RSX: false`, `Frame limit: Auto`.
 
 ## Not in this binary
 
