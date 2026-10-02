@@ -3583,8 +3583,10 @@ static inline void note_stcx_ok(u32 addr) noexcept
 // sharing with writers to *other* words of the line). After 256 consecutive failures on a line, a stwcx. whose own data still
 // equals the lwarx value adopts the line's current reservation time and proceeds as a plain atomic compare-and-swap.
 // Lock-free code with version counters (like BO2's) is correct under CAS semantics; only code that depends on losing the
-// reservation without any change to its own bytes could differ, and only while already starved. Always on (it only ever
+// reservation without any change to its own bytes could differ, and only while already starved. Gated by the option below (it only ever
 // triggers on a starvation streak); counted in g_stcx_refresh.
+// Per-game opt-in via 'PPU Starvation CAS Refresh' (default false): it turns LL/SC into CAS, unsafe for lock-free code without version
+// counters (suspected cause of an MK deadlock when it was always on, 2026-10-02).
 atomic_t<u64> g_stcx_refresh{};
 
 static inline bool stcx_starved(u32 addr) noexcept
@@ -3722,7 +3724,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		}
 	}
 
-	if (old_data == data && rtime != (res & -128) && stcx_starved(addr))
+	if (g_cfg.core.ppu_starvation_cas_refresh && old_data == data && rtime != (res & -128) && stcx_starved(addr))
 	{
 		// False-sharing starvation: our 8 bytes are unchanged, only the line's reservation time moved. Adopt it (see above).
 		rtime = res & -128;
