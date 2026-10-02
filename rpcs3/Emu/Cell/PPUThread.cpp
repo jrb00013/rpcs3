@@ -3573,6 +3573,14 @@ static inline void note_stcx_ok(u32 addr) noexcept
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
 
+// Why stwcx./stdcx. failed (livelock diagnosis, BO2 2026-10-02: ~250k failures/s on one line):
+//   [0] data differs from the lwarx value (another writer changed the data itself)
+//   [1] reservation time differs (something wrote to the 128-byte line since lwarx, data may be unchanged)
+//   [2] reservation locked/changed at lock time (fetch_op in the 8-byte path)
+//   [3] 128-byte path: already locked or updated
+//   [4] address mismatch with the reservation
+atomic_t<u64> g_stcx_fail_why[5]{};
+
 // True if a PPU stwcx./stdcx. is starved on this 128-byte line: >= 256 consecutive failures, the latest within ~50 us.
 // Used by SPU GETLLAR/PUTLLC to give PPU atomics priority when "PPU Reservation Priority Over SPUs" is on:
 // continuous SPURS polling of a shared line otherwise starves the PPU lwarx/stwcx. retry loop (BO2, issue #3).
@@ -3613,7 +3621,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
@@ -3677,6 +3685,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 	if (old_data != data || rtime != (res & -128))
 	{
+		g_stcx_fail_why[old_data != data ? 0 : 1]++;
 		note_stcx_fail(addr);
 		ppu.raddr = 0;
 		ppu.res_cached = 0;
@@ -3701,6 +3710,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 			if (!_ok)
 			{
 				// Already locked or updated: give up
+				g_stcx_fail_why[3]++;
 				note_stcx_fail(addr);
 				return false;
 			}
@@ -3775,6 +3785,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		// Give up if reservation has been locked or updated
 		if (!_ok)
 		{
+			g_stcx_fail_why[2]++;
 			note_stcx_fail(addr);
 			ppu.last_faddr = 0;
 			return false;
