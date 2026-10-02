@@ -3570,6 +3570,21 @@ static inline void note_stcx_ok(u32 addr) noexcept
 	}
 }
 
+// couchlink: progress guarantee for starved PPU atomics (BO2 livelock 2026-10-02: ~250k stdcx. failures/s on one 128-byte line
+// holding several lock-free list heads; the lwarx value was unchanged, so the loser was the reservation-time check, i.e. false
+// sharing with writers to *other* words of the line). After 256 consecutive failures on a line, a stwcx. whose own data still
+// equals the lwarx value adopts the line's current reservation time and proceeds as a plain atomic compare-and-swap.
+// Lock-free code with version counters (like BO2's) is correct under CAS semantics; only code that depends on losing the
+// reservation without any change to its own bytes could differ, and only while already starved. Always on (it only ever
+// triggers on a starvation streak); counted in g_stcx_refresh.
+atomic_t<u64> g_stcx_refresh{};
+
+static inline bool stcx_starved(u32 addr) noexcept
+{
+	const auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && e.streak.load() >= 256;
+}
+
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
 
@@ -3621,7 +3636,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; starvation refreshes=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_refresh.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
@@ -3646,7 +3661,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 	auto& data = const_cast<atomic_be_t<u64>&>(vm::_ref<atomic_be_t<u64>>(addr & -8));
 	auto& res = vm::reservation_acquire(addr);
-	const u64 rtime = ppu.rtime;
+	u64 rtime = ppu.rtime;
 
 	be_t<u64> old_data = 0;
 	std::memcpy(&old_data, &ppu.rdata[addr & 0x78], sizeof(old_data));
@@ -3681,6 +3696,13 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 			ppu.res_cached = 0;
 			return false;
 		}
+	}
+
+	if (old_data == data && rtime != (res & -128) && stcx_starved(addr))
+	{
+		// False-sharing starvation: our 8 bytes are unchanged, only the line's reservation time moved. Adopt it (see above).
+		rtime = res & -128;
+		g_stcx_refresh++;
 	}
 
 	if (old_data != data || rtime != (res & -128))
