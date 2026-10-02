@@ -3383,25 +3383,16 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	return true;
 }
 
-// couchlink: make "PPU Reservation Priority Over SPUs" apply to the PPU lwarx/stwcx. path too.
-// vm::writer_lock already honors it, but a PPU stwcx. that merely loses the race against SPU GETLLAR/PUTLLC on the
-// same 128-byte line never reaches that code and can starve for minutes while SPURS kernels poll (BO2 lobby stalls).
-// When a PPU atomic recently failed on this line, back off ~10 us before touching it so the PPU can complete.
-extern bool ppu_stcx_recently_failed(u32 addr);
+// couchlink: hand the line to a starved PPU atomic (see ppu_stcx_wait_for_ppu in PPUThread.cpp). Always on: it only ever
+// does anything for a line where a PPU lwarx/stwcx. has failed >= 8 times in a row, and then for at most ~50 us per access.
+extern u32 ppu_stcx_wait_for_ppu(u32 addr);
 extern atomic_t<u64> g_spu_ppu_prio_backoffs;
 
 static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
 {
-	if (!g_cfg.core.ppu_reservation_priority_over_spu || !addr)
+	if (addr && ppu_stcx_wait_for_ppu(addr))
 	{
-		return;
-	}
-
-	if (ppu_stcx_recently_failed(addr))
-	{
-		static const u64 delay = std::max<u64>(utils::get_tsc_freq() / 100000, 1000); // ~10 us
 		g_spu_ppu_prio_backoffs++;
-		utils::busy_wait(delay);
 	}
 }
 

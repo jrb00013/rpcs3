@@ -3545,6 +3545,7 @@ namespace
 		atomic_t<u64> count{};
 		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
 		atomic_t<u32> streak{}; // consecutive failures with no success on this line
+		atomic_t<u64> want_tsc{}; // TSC at which a starved PPU asked SPUs to hold off this line; 0 = not waiting
 	};
 
 	std::array<stcx_fail_slot, 4096> s_stcx_fail;
@@ -3556,7 +3557,13 @@ static inline void note_stcx_fail(u32 addr) noexcept
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 	e.addr.release(addr & -128);
 	e.tsc.release(utils::get_tsc());
-	e.streak++;
+
+	if (++e.streak >= 8)
+	{
+		// Starving: ask SPUs to hold off this line until we succeed (see ppu_stcx_wait_for_ppu).
+		e.want_tsc.release(e.tsc.load());
+	}
+
 	e.count++;
 }
 
@@ -3567,6 +3574,7 @@ static inline void note_stcx_ok(u32 addr) noexcept
 	if (e.streak)
 	{
 		e.streak.release(0);
+		e.want_tsc.release(0);
 	}
 }
 
@@ -3596,16 +3604,32 @@ atomic_t<u64> g_spu_ppu_prio_backoffs{};
 //   [4] address mismatch with the reservation
 atomic_t<u64> g_stcx_fail_why[5]{};
 
-// True if a PPU stwcx./stdcx. is starved on this 128-byte line: >= 256 consecutive failures, the latest within ~50 us.
-// Used by SPU GETLLAR/PUTLLC to give PPU atomics priority when "PPU Reservation Priority Over SPUs" is on:
-// continuous SPURS polling of a shared line otherwise starves the PPU lwarx/stwcx. retry loop (BO2, issue #3).
-bool ppu_stcx_recently_failed(u32 addr)
+// Handoff for starved PPU atomics (BO2 SPURS stalls, issue #3). The SPURS kernels poll the same 128-byte lines the PPU
+// updates with lwarx/stwcx. at full speed, so under emulation timing a PPU atomic can lose for minutes and the game, waiting on
+// SPURS services, hangs. When a PPU atomic has failed 8 times in a row on a line it flags the line; an SPU GETLLAR/PUTLLC on that
+// line then pauses until the PPU succeeds (flag cleared) or ~50 us pass, whichever is first. Unlike a fixed sleep (c96e609:
+// 100M back-offs, BO2 ~1 FPS) the SPU only waits as long as the PPU actually needs, and never more than the cap.
+// Returns the number of pause iterations spent (0 = line not flagged).
+u32 ppu_stcx_wait_for_ppu(u32 addr)
 {
-	static const u64 window = std::max<u64>(utils::get_tsc_freq() / 20000, 1000);
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
-	// Only a genuinely starved PPU atomic counts: a long run of failures with no success. Isolated failures are normal
-	// contention (the first version backed off on every one and dropped BO2 to ~1 FPS).
-	return e.addr.load() == (addr & -128) && e.streak.load() >= 256 && (utils::get_tsc() - e.tsc.load()) < window;
+
+	if (e.addr.load() != (addr & -128) || !e.want_tsc.load())
+	{
+		return 0;
+	}
+
+	static const u64 cap = std::max<u64>(utils::get_tsc_freq() / 20000, 1000); // ~50 us
+	const u64 start = utils::get_tsc();
+	u32 spins = 0;
+
+	while (e.want_tsc.load() && utils::get_tsc() - start < cap)
+	{
+		utils::pause();
+		spins++;
+	}
+
+	return spins;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
