@@ -1313,6 +1313,28 @@ public:
 			spu.dump_all(out);
 		});
 
+		// Kernel event queues: queued events and who waits. A thread blocked in sys_event_queue_receive on a queue that has no
+		// events and no producer is a lost notification (MK deadlock 2026-10-02: FMOD thread on the SPURS queue 0x8d00f900).
+		// try_lock only: never block the diagnostics thread on a queue mutex.
+		std::string queues_dump = "\nKernel event queues (id key size queued pq sq):";
+		u32 qcount = 0;
+		idm::select<lv2_obj, lv2_event_queue>([&](u32 id, lv2_event_queue& q)
+		{
+			qcount++;
+			if (q.mutex.try_lock_shared())
+			{
+				fmt::append(queues_dump, "\n\tqueue 0x%x key=0x%llx size=%u queued=%zu pq=%s sq=%s", id, q.key, q.size, q.events.size(), q.pq ? "WAIT" : "-", q.sq ? "WAIT" : "-");
+				q.mutex.unlock_shared();
+			}
+			else
+			{
+				fmt::append(queues_dump, "\n\tqueue 0x%x (mutex busy)", id);
+			}
+		});
+
+		out += queues_dump;
+		fmt::append(out, "\n(%u event queues)", qcount);
+
 		std::string stcx;
 		ppu_report_stcx_failures(stcx, 0, 16);
 
