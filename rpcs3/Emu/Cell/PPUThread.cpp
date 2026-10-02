@@ -3544,6 +3544,7 @@ namespace
 		atomic_t<u32> addr{};
 		atomic_t<u64> count{};
 		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
+		atomic_t<u32> streak{}; // consecutive failures with no success on this line
 	};
 
 	std::array<stcx_fail_slot, 4096> s_stcx_fail;
@@ -3555,20 +3556,33 @@ static inline void note_stcx_fail(u32 addr) noexcept
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 	e.addr.release(addr & -128);
 	e.tsc.release(utils::get_tsc());
+	e.streak++;
 	e.count++;
+}
+
+static inline void note_stcx_ok(u32 addr) noexcept
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+
+	if (e.streak)
+	{
+		e.streak.release(0);
+	}
 }
 
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
 
-// True if a PPU stwcx./stdcx. failed on this 128-byte line within the last ~50 us.
+// True if a PPU stwcx./stdcx. is starved on this 128-byte line: >= 256 consecutive failures, the latest within ~50 us.
 // Used by SPU GETLLAR/PUTLLC to give PPU atomics priority when "PPU Reservation Priority Over SPUs" is on:
 // continuous SPURS polling of a shared line otherwise starves the PPU lwarx/stwcx. retry loop (BO2, issue #3).
 bool ppu_stcx_recently_failed(u32 addr)
 {
 	static const u64 window = std::max<u64>(utils::get_tsc_freq() / 20000, 1000);
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
-	return e.addr.load() == (addr & -128) && (utils::get_tsc() - e.tsc.load()) < window;
+	// Only a genuinely starved PPU atomic counts: a long run of failures with no success. Isolated failures are normal
+	// contention (the first version backed off on every one and dropped BO2 to ~1 FPS).
+	return e.addr.load() == (addr & -128) && e.streak.load() >= 256 && (utils::get_tsc() - e.tsc.load()) < window;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
@@ -3715,6 +3729,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 					{
 						data.release(new_data);
 						res += 64;
+						note_stcx_ok(addr);
 						return true;
 					}
 
@@ -3731,7 +3746,14 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (new_data == old_data)
 		{
 			ppu.last_faddr = 0;
-			return res.compare_and_swap_test(rtime, rtime + 128);
+
+			if (res.compare_and_swap_test(rtime, rtime + 128))
+			{
+				note_stcx_ok(addr);
+				return true;
+			}
+
+			return false;
 		}
 
 		// Aligned 8-byte reservations will be used here
@@ -3762,6 +3784,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (data.compare_exchange(old_data, new_data))
 		{
 			res += 128 - lock_bits;
+			note_stcx_ok(addr);
 			return true;
 		}
 
