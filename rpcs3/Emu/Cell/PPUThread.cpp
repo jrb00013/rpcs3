@@ -3724,14 +3724,19 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		}
 	}
 
-	if (g_cfg.core.ppu_starvation_cas_refresh && old_data == data && rtime != (res & -128) && stcx_starved(addr))
+	// False-sharing starvation (BO2, issue #3): our 8 bytes are unchanged, only the line's reservation time moved, and it keeps moving
+	// (four SPURS kernels PUTLLC the same line). Once starved, ignore the reservation TIME in BOTH checks below: this one and the
+	// one inside the 8-byte fetch_op, which alone accounted for ~8x more failures ('locked8') than this first check, so relaxing only
+	// this check (the first version) could never break the livelock. The data compare_exchange still guards the store itself, and
+	// a held line lock ((r & 127) != 0) still fails, so this is CAS semantics, not a free pass.
+	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && stcx_starved(addr);
+
+	if (adopt_rtime && rtime != (res & -128))
 	{
-		// False-sharing starvation: our 8 bytes are unchanged, only the line's reservation time moved. Adopt it (see above).
-		rtime = res & -128;
 		g_stcx_refresh++;
 	}
 
-	if (old_data != data || rtime != (res & -128))
+	if (old_data != data || (!adopt_rtime && rtime != (res & -128)))
 	{
 		g_stcx_fail_why[old_data != data ? 0 : 1]++;
 		note_stcx_fail(addr);
@@ -3821,7 +3826,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
 		{
-			if ((r & -128) != rtime || (r & 127))
+			if ((!adopt_rtime && (r & -128) != rtime) || (r & 127))
 			{
 				return false;
 			}
