@@ -3383,6 +3383,19 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	return true;
 }
 
+// couchlink: hand the line to a starved PPU atomic (see ppu_stcx_wait_for_ppu in PPUThread.cpp). Always on: it only ever
+// does anything for a line where a PPU lwarx/stwcx. has failed >= 8 times in a row, and then for at most ~50 us per access.
+extern u32 ppu_stcx_wait_for_ppu(u32 addr);
+extern atomic_t<u64> g_spu_ppu_prio_backoffs;
+
+static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
+{
+	if (addr && ppu_stcx_wait_for_ppu(addr))
+	{
+		g_spu_ppu_prio_backoffs++;
+	}
+}
+
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
 	perf_meter<"PUTLLC-"_u64> perf0;
@@ -4258,6 +4271,7 @@ bool spu_thread::process_mfc_cmd()
 		perf_meter<"GETLLAR"_u64> perf0;
 
 		const u32 addr = ch_mfc_cmd.eal & -128;
+		spu_yield_to_ppu_atomic(addr);
 		const auto& data = vm::_ref<spu_rdata_t>(addr);
 
 		if (addr == last_faddr)
@@ -4624,6 +4638,8 @@ bool spu_thread::process_mfc_cmd()
 
 	case MFC_PUTLLC_CMD:
 	{
+		spu_yield_to_ppu_atomic(raddr);
+
 		// Avoid logging useless commands if there is no reservation
 		const bool dump = g_cfg.core.mfc_debug && raddr;
 
