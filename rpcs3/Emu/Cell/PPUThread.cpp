@@ -3588,6 +3588,7 @@ static inline void note_stcx_ok(u32 addr) noexcept
 // Per-game opt-in via 'PPU Starvation CAS Refresh' (default false): it turns LL/SC into CAS, unsafe for lock-free code without version
 // counters (suspected cause of an MK deadlock when it was always on, 2026-10-02).
 atomic_t<u64> g_stcx_refresh{};
+atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock while starved
 
 static inline bool stcx_starved(u32 addr) noexcept
 {
@@ -3662,7 +3663,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; starvation refreshes=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_refresh.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
@@ -3824,16 +3825,43 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 		const u64 lock_bits = vm::rsrv_unique_lock;
 
-		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
+		auto try_lock_line = [&]()
 		{
-			if ((!adopt_rtime && (r & -128) != rtime) || (r & 127))
+			return res.fetch_op([&](u64& r)
 			{
-				return false;
+				if ((!adopt_rtime && (r & -128) != rtime) || (r & 127))
+				{
+					return false;
+				}
+
+				r += lock_bits;
+				return true;
+			});
+		};
+
+		auto lock_result = try_lock_line();
+
+		// couchlink: a starved store (BO2 SPURS, issue #3) that fails only because the line lock is held is waiting on an SPU's PUTLLC
+		// commit, which is a few microseconds and never blocks on us. Wait for it (bounded) instead of failing and retrying at full
+		// speed: BO2 dump 2026-10-03 01:16 showed 500M of these 'locked' failures against 120M 'line-written', i.e. four SPURS
+		// kernels hold the lock almost continuously and the PPU only ever got a lucky instant.
+		if (!lock_result.second && adopt_rtime && (lock_result.first & 127))
+		{
+			for (u32 spin = 0; spin < 4000; spin++)
+			{
+				utils::pause();
+				lock_result = try_lock_line();
+
+				if (lock_result.second || !(lock_result.first & 127))
+				{
+					break;
+				}
 			}
 
-			r += lock_bits;
-			return true;
-		});
+			g_stcx_lockwait++;
+		}
+
+		const bool _ok = lock_result.second;
 
 		// Give up if reservation has been locked or updated
 		if (!_ok)
