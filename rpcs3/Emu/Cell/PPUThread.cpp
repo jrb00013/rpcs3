@@ -3600,6 +3600,14 @@ static inline void note_stcx_ok(ppu_thread& ppu, u32 addr) noexcept
 // triggers on a starvation streak); counted in g_stcx_refresh.
 // Per-game opt-in via 'PPU Starvation CAS Refresh' (default false): it turns LL/SC into CAS, unsafe for lock-free code without version
 // counters (suspected cause of an MK deadlock when it was always on, 2026-10-02).
+// Consecutive failures on one line before a starved stwcx. adopts the line's reservation time and waits for a held line lock.
+// BO2 freeze 2026-10-04 00:19 (Secondary spinning on a SPURS counter, 49M failures/10 s): the old threshold of 256 was almost never
+// reached. Successes are interleaved (about one per 50 attempts, from the 'locked8' failures plus 'line-written' ones against six
+// SPU kernels), and every success resets the streak, so P(streak >= 256) is ~0.5%: only ~55 refreshes and ~5k lock-waits per 10 s
+// against 49M failures, i.e. the fix engaged on a fraction of a percent of the failing stores. 8 matches the SPU handoff threshold
+// (note_stcx_fail), so by then the SPUs are already holding off this line.
+constexpr u32 stcx_adopt_streak = 8;
+
 atomic_t<u64> g_stcx_refresh{};
 atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock while starved
 
@@ -3737,7 +3745,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	// one inside the 8-byte fetch_op, which alone accounted for ~8x more failures ('locked8') than this first check, so relaxing only
 	// this check (the first version) could never break the livelock. The data compare_exchange still guards the store itself, and
 	// a held line lock ((r & 127) != 0) still fails, so this is CAS semantics, not a free pass.
-	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu.stcx_streak >= 256 && ppu.stcx_streak_line == (addr & -128);
+	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu.stcx_streak >= stcx_adopt_streak && ppu.stcx_streak_line == (addr & -128);
 
 	if (adopt_rtime && rtime != (res & -128))
 	{
