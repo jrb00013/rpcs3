@@ -325,6 +325,10 @@ public:
 	u64 last_ftime = 0;
 	u32 last_faddr = 0;
 	u64 last_fail = 0;
+	// couchlink: consecutive stwcx./stdcx. failures of THIS thread on one 128-byte line (reset on this thread's own success).
+	// A per-line counter shared by all threads never reached the starvation threshold because other threads' successes reset it.
+	u32 stcx_streak = 0;
+	u32 stcx_streak_line = 0;
 	u64 last_succ = 0;
 	u64 exec_bytes = 0; // Amount of "bytes" executed (4 for each instruction)
 

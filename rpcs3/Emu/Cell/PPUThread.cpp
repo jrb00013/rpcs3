@@ -3552,8 +3552,19 @@ namespace
 	std::array<u64, 4096> s_stcx_prev{};
 }
 
-static inline void note_stcx_fail(u32 addr) noexcept
+static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 {
+	// Per-thread streak (drives the starvation refresh / lock wait). The shared per-line table below only feeds diagnostics and the SPU handoff.
+	if (ppu.stcx_streak_line == (addr & -128))
+	{
+		ppu.stcx_streak++;
+	}
+	else
+	{
+		ppu.stcx_streak_line = addr & -128;
+		ppu.stcx_streak = 1;
+	}
+
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 	e.addr.release(addr & -128);
 	e.tsc.release(utils::get_tsc());
@@ -3567,8 +3578,10 @@ static inline void note_stcx_fail(u32 addr) noexcept
 	e.count++;
 }
 
-static inline void note_stcx_ok(u32 addr) noexcept
+static inline void note_stcx_ok(ppu_thread& ppu, u32 addr) noexcept
 {
+	ppu.stcx_streak = 0;
+
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 
 	if (e.streak)
@@ -3589,12 +3602,6 @@ static inline void note_stcx_ok(u32 addr) noexcept
 // counters (suspected cause of an MK deadlock when it was always on, 2026-10-02).
 atomic_t<u64> g_stcx_refresh{};
 atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock while starved
-
-static inline bool stcx_starved(u32 addr) noexcept
-{
-	const auto& e = s_stcx_fail[(addr >> 7) & 4095];
-	return e.addr.load() == (addr & -128) && e.streak.load() >= 256;
-}
 
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
@@ -3730,7 +3737,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	// one inside the 8-byte fetch_op, which alone accounted for ~8x more failures ('locked8') than this first check, so relaxing only
 	// this check (the first version) could never break the livelock. The data compare_exchange still guards the store itself, and
 	// a held line lock ((r & 127) != 0) still fails, so this is CAS semantics, not a free pass.
-	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && stcx_starved(addr);
+	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu.stcx_streak >= 256 && ppu.stcx_streak_line == (addr & -128);
 
 	if (adopt_rtime && rtime != (res & -128))
 	{
@@ -3740,7 +3747,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	if (old_data != data || (!adopt_rtime && rtime != (res & -128)))
 	{
 		g_stcx_fail_why[old_data != data ? 0 : 1]++;
-		note_stcx_fail(addr);
+		note_stcx_fail(ppu, addr);
 		ppu.raddr = 0;
 		ppu.res_cached = 0;
 		return false;
@@ -3765,7 +3772,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 			{
 				// Already locked or updated: give up
 				g_stcx_fail_why[3]++;
-				note_stcx_fail(addr);
+				note_stcx_fail(ppu, addr);
 				return false;
 			}
 
@@ -3793,7 +3800,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 					{
 						data.release(new_data);
 						res += 64;
-						note_stcx_ok(addr);
+						note_stcx_ok(ppu, addr);
 						return true;
 					}
 
@@ -3813,7 +3820,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 			if (res.compare_and_swap_test(rtime, rtime + 128))
 			{
-				note_stcx_ok(addr);
+				note_stcx_ok(ppu, addr);
 				return true;
 			}
 
@@ -3867,7 +3874,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (!_ok)
 		{
 			g_stcx_fail_why[2]++;
-			note_stcx_fail(addr);
+			note_stcx_fail(ppu, addr);
 			ppu.last_faddr = 0;
 			return false;
 		}
@@ -3876,7 +3883,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (data.compare_exchange(old_data, new_data))
 		{
 			res += 128 - lock_bits;
-			note_stcx_ok(addr);
+			note_stcx_ok(ppu, addr);
 			return true;
 		}
 
