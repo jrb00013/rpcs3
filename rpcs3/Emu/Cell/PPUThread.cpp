@@ -3656,11 +3656,26 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	return spins;
 }
 
-// True while a starved PPU atomic has asked SPUs to hold off this 128-byte line (want_tsc != 0).
+// True while a starved PPU recently asked SPUs to refuse PUTLLC on this 128-byte line.
+//
+// want_tsc itself is sticky until note_stcx_ok (no timeout). play14 (7c007ab) denied PUTLLC for the
+// entire sticky lifetime and wedged BO2 at load: after a brief burst of stwcx. fails, the PPU slept in
+// sys_timer_usleep while SPURS still needed PUTLLC — denies kept climbing (~586k/10s) with lock-waits
+// frozen, RSX still ~60 FPS. Cap the deny window by want_tsc age. note_stcx_fail refreshes want_tsc on
+// every subsequent fail, so a PPU that is still hammering (mid-match locked8 freeze) keeps the window
+// open; a PPU that walked away lets SPUs commit again after ~200 us.
 bool ppu_stcx_line_wanted(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
-	return e.addr.load() == (addr & -128) && e.want_tsc.load() != 0;
+	const u64 want = e.want_tsc.load();
+
+	if (e.addr.load() != (addr & -128) || !want)
+	{
+		return false;
+	}
+
+	static const u64 deny_cap = std::max<u64>(utils::get_tsc_freq() / 5000, 4000); // ~200 us
+	return utils::get_tsc() - want < deny_cap;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);

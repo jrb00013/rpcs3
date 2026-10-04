@@ -3462,6 +3462,8 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		// SPU still took rsrv_unique_lock while a starved PPU had want_tsc set on this line. Refuse the lock (fail PUTLLC) so the
 		// PPU's adopt/lock-wait path can commit; SPURS retries via the normal LR/GETLLAR loop. Per-game gate: same option as the
 		// PPU CAS refresh / lock-wait (default off → MK unchanged).
+		// ppu_stcx_line_wanted is age-capped (~200 us, refreshed by ongoing PPU fails) so a sticky want_tsc cannot starve
+		// SPURS forever after the PPU sleeps (BO2 load hang on play14 / aa9d0ca0).
 		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 		{
 			g_spu_ppu_prio_putllc_deny++;
