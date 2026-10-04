@@ -357,6 +357,29 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+      # couchlink: PR/branch builds used to skip cache save (master-only), so the fork never kept a
+      # warm MSVC ccache/deps. Save on every successful Windows job, and also upload both as artifacts
+      # so a local machine can `gh run download` them (Actions caches are not downloadable via gh).
+      - name: Upload Windows dependency cache
+        if: success()
+        uses: actions/upload-artifact@main
+        with:
+          name: Windows MSVC dependency cache
+          path: ${{ env.DEPS_CACHE_DIR }}
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload Windows ccache
+        if: success()
+        uses: actions/upload-artifact@main
+        with:
+          name: Windows MSVC ccache
+          path: ${{ env.CCACHE_DIR }}
+          retention-days: 7
+          compression-level: 6
+          if-no-files-found: warn
+
       - name: Deploy master build to GitHub Releases
         if: |
           github.event_name != 'pull_request' &&
@@ -367,14 +390,14 @@ jobs:
         run: .ci/github-upload.sh
 
       - name: Save Build Ccache
-        if: github.ref == 'refs/heads/master'
+        if: success()
         uses: actions/cache/save@main
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ steps.restore-build-ccache.outputs.cache-primary-key }}
 
       - name: Save Dependencies Cache
-        if: github.ref == 'refs/heads/master'
+        if: success()
         uses: actions/cache/save@main
         with:
           path: ${{ env.DEPS_CACHE_DIR }}
