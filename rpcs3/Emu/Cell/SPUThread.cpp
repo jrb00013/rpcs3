@@ -3385,8 +3385,12 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 
 // couchlink: hand the line to a starved PPU atomic (see ppu_stcx_wait_for_ppu in PPUThread.cpp). Always on: it only ever
 // does anything for a line where a PPU lwarx/stwcx. has failed >= 8 times in a row, and then for at most ~50 us per access.
+// Refusing PUTLLC's unique lock while the line is still wanted is gated by ppu_starvation_cas_refresh (BO2 opt-in) so MK cannot
+// regress: without that option the PPU does not adopt/wait, so denying SPU commits would only stall SPURS for no PPU gain.
 extern u32 ppu_stcx_wait_for_ppu(u32 addr);
+extern bool ppu_stcx_line_wanted(u32 addr);
 extern atomic_t<u64> g_spu_ppu_prio_backoffs;
+extern atomic_t<u64> g_spu_ppu_prio_putllc_deny;
 
 static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
 {
@@ -3453,6 +3457,16 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
 
 		const usz diff16_pos = scan16_rdata(to_write, rdata);
+
+		// couchlink: BO2 freeze 2026-10-04 01:40 — yield-before-PUTLLC alone left ~1.66M locked8/10s. After the ~50 us pause the
+		// SPU still took rsrv_unique_lock while a starved PPU had want_tsc set on this line. Refuse the lock (fail PUTLLC) so the
+		// PPU's adopt/lock-wait path can commit; SPURS retries via the normal LR/GETLLAR loop. Per-game gate: same option as the
+		// PPU CAS refresh / lock-wait (default off → MK unchanged).
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+			return false;
+		}
 
 		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
 		{

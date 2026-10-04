@@ -3613,6 +3613,8 @@ atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock
 
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
+// Number of times an SPU PUTLLC refused to take the line lock because want_tsc was still set after the yield window.
+atomic_t<u64> g_spu_ppu_prio_putllc_deny{};
 
 // Why stwcx./stdcx. failed (livelock diagnosis, BO2 2026-10-02: ~250k failures/s on one line):
 //   [0] data differs from the lwarx value (another writer changed the data itself)
@@ -3628,6 +3630,10 @@ atomic_t<u64> g_stcx_fail_why[5]{};
 // line then pauses until the PPU succeeds (flag cleared) or ~50 us pass, whichever is first. Unlike a fixed sleep (c96e609:
 // 100M back-offs, BO2 ~1 FPS) the SPU only waits as long as the PPU actually needs, and never more than the cap.
 // Returns the number of pause iterations spent (0 = line not flagged).
+//
+// The pause alone is not enough (BO2 freeze 2026-10-04 01:40 on play13): after the ~50 us window the SPU still ran PUTLLC and
+// re-took rsrv_unique_lock while want_tsc was set, producing ~1.66M locked8 failures/10 s even though refreshes/lock-waits were
+// firing. Callers must also refuse to take the line lock while ppu_stcx_line_wanted() is true (see do_putllc).
 u32 ppu_stcx_wait_for_ppu(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
@@ -3648,6 +3654,13 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	}
 
 	return spins;
+}
+
+// True while a starved PPU atomic has asked SPUs to hold off this 128-byte line (want_tsc != 0).
+bool ppu_stcx_line_wanted(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && e.want_tsc.load() != 0;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
@@ -3678,7 +3691,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
