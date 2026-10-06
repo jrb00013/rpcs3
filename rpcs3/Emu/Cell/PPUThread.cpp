@@ -3546,6 +3546,12 @@ namespace
 		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
 		atomic_t<u32> streak{}; // consecutive failures with no success on this line
 		atomic_t<u64> want_tsc{}; // TSC at which a starved PPU asked SPUs to hold off this line; 0 = not waiting
+		// Count of PPU threads currently inside the adopt/lock-wait spin on this line.
+		// PUTLLC deny must stay armed for the whole spin: want_tsc alone is age-capped
+		// (~200 us) for the BO2 boot wedge, but the lock-wait loop runs for up to ~4000
+		// pauses without calling note_stcx_fail — so the age-cap expired mid-spin and
+		// SPUs re-took the line (play15: +1.6M locked8/10s at round ~4 zombies on 0x2e20880).
+		atomic_t<u32> lock_waiters{};
 	};
 
 	std::array<stcx_fail_slot, 4096> s_stcx_fail;
@@ -3656,20 +3662,32 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	return spins;
 }
 
-// True while a starved PPU recently asked SPUs to refuse PUTLLC on this 128-byte line.
+// True while SPUs must refuse PUTLLC on this 128-byte line.
 //
-// want_tsc itself is sticky until note_stcx_ok (no timeout). play14 (7c007ab) denied PUTLLC for the
-// entire sticky lifetime and wedged BO2 at load: after a brief burst of stwcx. fails, the PPU slept in
-// sys_timer_usleep while SPURS still needed PUTLLC — denies kept climbing (~586k/10s) with lock-waits
-// frozen, RSX still ~60 FPS. Cap the deny window by want_tsc age. note_stcx_fail refreshes want_tsc on
-// every subsequent fail, so a PPU that is still hammering (mid-match locked8 freeze) keeps the window
-// open; a PPU that walked away lets SPUs commit again after ~200 us.
+// Two signals (OR):
+// 1) Fresh want_tsc (~200 us age-cap). Sticky want_tsc until note_stcx_ok wedged BO2 at
+//    load on play14 (PPU asleep in sys_timer_usleep, denies ~586k/10s). Age-cap lets SPURS
+//    through once the PPU walks away; note_stcx_fail refreshes while it keeps failing.
+// 2) lock_waiters > 0 — a starved PPU is inside the adopt/lock-wait spin. That loop does
+//    not call note_stcx_fail, so (1) alone expired mid-spin and SPUs re-locked the line
+//    (play15 mid-match freeze: locked8 +1.6M/10s on 0x2e20880 despite active lock-waits).
 bool ppu_stcx_line_wanted(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+
+	if (e.addr.load() != (addr & -128))
+	{
+		return false;
+	}
+
+	if (e.lock_waiters.load())
+	{
+		return true;
+	}
+
 	const u64 want = e.want_tsc.load();
 
-	if (e.addr.load() != (addr & -128) || !want)
+	if (!want)
 	{
 		return false;
 	}
@@ -3890,6 +3908,10 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		// kernels hold the lock almost continuously and the PPU only ever got a lucky instant.
 		if (!lock_result.second && adopt_rtime && (lock_result.first & 127))
 		{
+			auto& e = s_stcx_fail[(addr >> 7) & 4095];
+			e.addr.release(addr & -128);
+			e.lock_waiters++; // arm PUTLLC deny for the whole spin (see ppu_stcx_line_wanted)
+
 			for (u32 spin = 0; spin < 4000; spin++)
 			{
 				utils::pause();
@@ -3901,6 +3923,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 				}
 			}
 
+			e.lock_waiters--;
 			g_stcx_lockwait++;
 		}
 
