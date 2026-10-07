@@ -3417,6 +3417,22 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
+		// couchlink: refuse ANY reservation mutation on a PPU-wanted line (unique lock OR
+		// accurate unchanged writeback CAS rtime+128). play14–16 put this check only on the
+		// changed-data path, *after* the unchanged early-outs — so with Accurate SPU
+		// Reservations, SPURS kept bumping rtime on 0x2e20880 without ever hitting deny
+		// (play16 live: denyΔ ~1.5–5k vs locked8Δ ~1M / line-writtenΔ ~1.5M per 10s). Those
+		// rtime bumps are the line-written storm and the TOCTOU locked8s (rtime moves
+		// between PPU's early check and fetch_op with no unique lock held), so lock_waiters
+		// (only armed when adopt_rtime sees lock bits) never covered the dominant path.
+		// Gate + age-cap / lock_waiters unchanged: MK off; boot wedge still impossible once
+		// the PPU sleeps (want_tsc ages out ~200 us, lock_waiters==0).
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+			return false;
+		}
+
 		const auto& to_write = _ref<spu_rdata_t>(args.lsa & 0x3ff80);
 		auto& res = vm::reservation_acquire(addr);
 
@@ -3457,19 +3473,6 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
 
 		const usz diff16_pos = scan16_rdata(to_write, rdata);
-
-		// couchlink: BO2 freeze 2026-10-04 01:40 — yield-before-PUTLLC alone left ~1.66M locked8/10s. After the ~50 us pause the
-		// SPU still took rsrv_unique_lock while a starved PPU had want_tsc set on this line. Refuse the lock (fail PUTLLC) so the
-		// PPU's adopt/lock-wait path can commit; SPURS retries via the normal LR/GETLLAR loop. Per-game gate: same option as the
-		// PPU CAS refresh / lock-wait (default off → MK unchanged).
-		// ppu_stcx_line_wanted: age-capped want_tsc (~200 us) OR active lock_waiters (PPU in
-		// adopt/lock-wait spin). Age-cap alone expired mid-spin on play15 and reopened the
-		// mid-match locked8 freeze; lock_waiters keeps deny armed for the whole wait.
-		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
-		{
-			g_spu_ppu_prio_putllc_deny++;
-			return false;
-		}
 
 		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
 		{
