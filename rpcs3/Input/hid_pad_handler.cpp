@@ -207,16 +207,20 @@ bool hid_pad_handler<Device>::Init()
 		m_controllers.emplace(m_name_string + std::to_string(i), std::make_shared<Device>());
 	}
 
-	enumerate_devices();
-	update_devices();
-
+	// Never call hid_enumerate on the Init caller. Init is reachable from the GUI
+	// thread (list_devices / get_hid_device / pad settings). On Windows, hid_enumerate
+	// can block indefinitely on Bluetooth DualSense (duplicate pairings / flaky HID),
+	// which freezes the whole UI as Not Responding. The enumerator thread below owns
+	// enumeration; process() -> update_devices() binds pads when results arrive.
 	m_is_init = true;
 
 	m_enumeration_thread = std::make_unique<named_thread<std::function<void()>>>(fmt::format("%s Enumerator", m_type), [this]()
 	{
 		while (thread_ctrl::state() != thread_state::aborting)
 		{
-			if (pad::g_enabled && Emu.IsRunning())
+			// Enumerate whenever pads are enabled — not only while a game is running —
+			// so the first pass (and pad settings) can bind without blocking Init.
+			if (pad::g_enabled)
 			{
 				enumerate_devices();
 			}
