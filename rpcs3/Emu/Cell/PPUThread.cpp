@@ -3696,6 +3696,15 @@ bool ppu_stcx_line_wanted(u32 addr)
 	return utils::get_tsc() - want < deny_cap;
 }
 
+// True only while a starved PPU is inside ppu_store_reservation with adopt_rtime
+// (see lock_waiter_hold). Used to gate Accurate-reservations unchanged PUTLLC
+// writebacks without the play17 blanket want_tsc deny that can wedge boot.
+bool ppu_stcx_lock_waited(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && e.lock_waiters.load() != 0;
+}
+
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
 
 // Print the hottest failing lines. Delta since the previous call. Returns total failures in the interval.
@@ -3807,6 +3816,35 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		return false;
 	}
 
+	// play18: arm lock_waiters for the whole starved adopt attempt — not only the
+	// unique-lock spin. play16 only incremented while (r & 127), so Accurate SPU
+	// unchanged PUTLLC (CAS rtime+128, no lock bits) never saw waiters and kept
+	// storming the line. Holding waiters here lets do_putllc deny that writeback
+	// without a blanket want_tsc deny (play17 boot wedge). Cleared when this
+	// scope ends (success or fail); sleeping PPU => waiters==0 => SPUs proceed.
+	struct lock_waiter_hold
+	{
+		stcx_fail_slot* e = nullptr;
+		lock_waiter_hold(u32 a, bool arm)
+		{
+			if (!arm)
+			{
+				return;
+			}
+
+			e = &s_stcx_fail[(a >> 7) & 4095];
+			e->addr.release(a & -128);
+			e->lock_waiters++;
+		}
+		~lock_waiter_hold()
+		{
+			if (e)
+			{
+				e->lock_waiters--;
+			}
+		}
+	} adopt_hold{addr, adopt_rtime};
+
 	if ([&]()
 	{
 		if (ppu.use_full_rdata) [[unlikely]]
@@ -3906,12 +3944,9 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		// commit, which is a few microseconds and never blocks on us. Wait for it (bounded) instead of failing and retrying at full
 		// speed: BO2 dump 2026-10-03 01:16 showed 500M of these 'locked' failures against 120M 'line-written', i.e. four SPURS
 		// kernels hold the lock almost continuously and the PPU only ever got a lucky instant.
+		// lock_waiters is already held by adopt_hold for the whole adopt_rtime attempt (play18).
 		if (!lock_result.second && adopt_rtime && (lock_result.first & 127))
 		{
-			auto& e = s_stcx_fail[(addr >> 7) & 4095];
-			e.addr.release(addr & -128);
-			e.lock_waiters++; // arm PUTLLC deny for the whole spin (see ppu_stcx_line_wanted)
-
 			for (u32 spin = 0; spin < 4000; spin++)
 			{
 				utils::pause();
@@ -3923,7 +3958,6 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 				}
 			}
 
-			e.lock_waiters--;
 			g_stcx_lockwait++;
 		}
 

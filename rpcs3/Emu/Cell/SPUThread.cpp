@@ -3389,6 +3389,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 // regress: without that option the PPU does not adopt/wait, so denying SPU commits would only stall SPURS for no PPU gain.
 extern u32 ppu_stcx_wait_for_ppu(u32 addr);
 extern bool ppu_stcx_line_wanted(u32 addr);
+extern bool ppu_stcx_lock_waited(u32 addr);
 extern atomic_t<u64> g_spu_ppu_prio_backoffs;
 extern atomic_t<u64> g_spu_ppu_prio_putllc_deny;
 
@@ -3417,27 +3418,6 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// couchlink: refuse ANY reservation mutation on a PPU-wanted line (unique lock OR
-		// accurate unchanged writeback CAS rtime+128). play14–16 put this check only on the
-		// changed-data path, *after* the unchanged early-outs — so with Accurate SPU
-		// Reservations, SPURS kept bumping rtime on 0x2e20880 without ever hitting deny
-		// (play16 live: denyΔ ~1.5–5k vs locked8Δ ~1M / line-writtenΔ ~1.5M per 10s). Those
-		// rtime bumps are the line-written storm and the TOCTOU locked8s (rtime moves
-		// between PPU's early check and fetch_op with no unique lock held), so lock_waiters
-		// (only armed when adopt_rtime sees lock bits) never covered the dominant path.
-		// Gate + age-cap / lock_waiters unchanged: MK off; boot wedge still impossible once
-		// the PPU sleeps (want_tsc ages out ~200 us, lock_waiters==0).
-		//
-		// play17 staged this; a same-night "won't boot" was separately traced to RPCS3
-		// Handler=DualSense while couchlink-ds-vhid was --backend xbox360 (HID enum
-		// wedged before main_thread — 0 PPU/0 SPU). play18 keeps this deny; pad config
-		// must stay XInput for xbox360 vhid.
-		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
-		{
-			g_spu_ppu_prio_putllc_deny++;
-			return false;
-		}
-
 		const auto& to_write = _ref<spu_rdata_t>(args.lsa & 0x3ff80);
 		auto& res = vm::reservation_acquire(addr);
 
@@ -3463,10 +3443,14 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play18: re-check at the writeback site. want_tsc can be refreshed by a
-			// starved PPU after the early deny above and before this CAS; without a
-			// second gate the rtime+128 bump still lands (play16 storm shape).
-			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			// play18: Accurate unchanged writeback (CAS rtime+128) is the play16 storm —
+			// it never took unique lock bits, so play16's deny-after-scan never ran and
+			// lock_waiters never armed. Deny ONLY while a starved PPU holds lock_waiters
+			// (adopt_hold for the whole adopt_rtime attempt). Do NOT deny on want_tsc
+			// alone here — that was play17's blanket early deny and can wedge boot when
+			// SPURS needs unchanged PUTLLC while want_tsc is being refreshed. Sleeping
+			// PPU => waiters==0 => this path proceeds (age-cap still covers unique-lock).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_lock_waited(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
 				return false;
@@ -3480,6 +3464,14 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
+			return false;
+		}
+
+		// couchlink: refuse unique-lock PUTLLC on a PPU-wanted line (want_tsc age-cap OR
+		// lock_waiters). Same gate as play15/16 for the changed-data path.
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
 			return false;
 		}
 
