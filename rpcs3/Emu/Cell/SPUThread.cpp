@@ -3427,6 +3427,11 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		// (only armed when adopt_rtime sees lock bits) never covered the dominant path.
 		// Gate + age-cap / lock_waiters unchanged: MK off; boot wedge still impossible once
 		// the PPU sleeps (want_tsc ages out ~200 us, lock_waiters==0).
+		//
+		// play17 staged this; a same-night "won't boot" was separately traced to RPCS3
+		// Handler=DualSense while couchlink-ds-vhid was --backend xbox360 (HID enum
+		// wedged before main_thread — 0 PPU/0 SPU). play18 keeps this deny; pad config
+		// must stay XInput for xbox360 vhid.
 		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 		{
 			g_spu_ppu_prio_putllc_deny++;
@@ -3456,6 +3461,15 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			{
 				raddr = 0;
 				return true;
+			}
+
+			// play18: re-check at the writeback site. want_tsc can be refreshed by a
+			// starved PPU after the early deny above and before this CAS; without a
+			// second gate the rtime+128 bump still lands (play16 storm shape).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				g_spu_ppu_prio_putllc_deny++;
+				return false;
 			}
 
 			// Writeback of unchanged data. Only check memory change
