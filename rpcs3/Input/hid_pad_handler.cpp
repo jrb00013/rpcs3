@@ -13,8 +13,17 @@
 #include "3rdparty/hidapi/hidapi/mac/hidapi_darwin.h"
 #endif
 
+#ifdef _WIN32
+#include <Windows.h>
+#include <setupapi.h>
+#include <cctype>
+#endif
+
 #include <algorithm>
+#include <cstdio>
 #include <memory>
+#include <string_view>
+#include <vector>
 
 LOG_CHANNEL(hid_log, "HID");
 
@@ -82,6 +91,7 @@ public:
 			return false;
 		}
 
+		hid_log.notice("HIDAPI initialized");
 		m_initialized = true;
 		return true;
 	}
@@ -282,6 +292,155 @@ void hid_pad_handler<Device>::enumerate_devices()
 		}
 	}
 #else
+#ifdef _WIN32
+	// Avoid hid_enumerate on Windows. It opens every HID interface (CreateFile +
+	// HidD_GetAttributes) and can block forever on a wedged Bluetooth DualSense
+	// node (duplicate pairing stuck in "Removing device", ghost audio endpoints).
+	// SetupDi interface listing returns paths without opening devices; VID/PID are
+	// matched from the path string (vid_XXXX/pid_YYYY or VID&XXXXXXXX_PID&YYYY).
+	{
+		static const GUID guid_devinterface_hid =
+			{0x4d1e55b2, 0xf16f, 0x11cf, {0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
+
+		const auto path_has_vid_pid = [](std::string_view path, u16 vid, u16 pid) -> bool
+		{
+			char vid_hid[16]{}, pid_hid[16]{}, pid_amp[16]{}, vid_tail[8]{};
+			std::snprintf(vid_hid, sizeof(vid_hid), "vid_%04x", vid);
+			std::snprintf(pid_hid, sizeof(pid_hid), "pid_%04x", pid);
+			std::snprintf(pid_amp, sizeof(pid_amp), "pid&%04x", pid);
+			std::snprintf(vid_tail, sizeof(vid_tail), "%04x", vid);
+
+			std::string lower(path);
+			for (char& c : lower)
+			{
+				c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+			}
+
+			const bool pid_ok = lower.find(pid_hid) != umax || lower.find(pid_amp) != umax;
+			if (!pid_ok)
+			{
+				return false;
+			}
+
+			if (lower.find(vid_hid) != umax)
+			{
+				return true;
+			}
+
+			// Bluetooth HID paths use VID&0002054C (last 4 hex digits = vendor id).
+			usz pos = 0;
+			while ((pos = lower.find("vid&", pos)) != umax)
+			{
+				const usz hex_start = pos + 4;
+				if (hex_start + 8 <= lower.size() && lower.compare(hex_start + 4, 4, vid_tail) == 0)
+				{
+					return true;
+				}
+				pos = hex_start;
+			}
+
+			return false;
+		};
+
+		HDEVINFO dev_info = SetupDiGetClassDevsW(&guid_devinterface_hid, nullptr, nullptr,
+			DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+		if (dev_info != INVALID_HANDLE_VALUE)
+		{
+			SP_DEVICE_INTERFACE_DATA iface{};
+			iface.cbSize = sizeof(iface);
+
+			for (DWORD index = 0; SetupDiEnumDeviceInterfaces(dev_info, nullptr, &guid_devinterface_hid, index, &iface); index++)
+			{
+				DWORD needed = 0;
+				SetupDiGetDeviceInterfaceDetailW(dev_info, &iface, nullptr, 0, &needed, nullptr);
+				if (needed < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
+				{
+					continue;
+				}
+
+				std::vector<u8> buffer(needed);
+				auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buffer.data());
+				detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+				if (!SetupDiGetDeviceInterfaceDetailW(dev_info, &iface, detail, needed, nullptr, nullptr))
+				{
+					continue;
+				}
+
+				// Narrow path the same way hidapi does (UTF-16 device path -> UTF-8/ACP).
+				const wchar_t* wpath = detail->DevicePath;
+				const int nbytes = WideCharToMultiByte(CP_ACP, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
+				if (nbytes <= 1)
+				{
+					continue;
+				}
+
+				std::string path(static_cast<usz>(nbytes - 1), '\0');
+				WideCharToMultiByte(CP_ACP, 0, wpath, -1, path.data(), nbytes, nullptr, nullptr);
+
+				bool matched = false;
+				for (const auto& [vid, pid] : m_ids)
+				{
+					if (path_has_vid_pid(path, vid, pid))
+					{
+						matched = true;
+						break;
+					}
+				}
+
+				if (!matched)
+				{
+					continue;
+				}
+
+				// Bluetooth device nodes (BTHENUM\...) are not usable HID open paths for
+				// pad input and a wedged "Removing device" pairing can hang CreateFile /
+				// hid_open_path forever. Prefer the HID class interface paths only.
+				std::string lower = path;
+				for (char& c : lower)
+				{
+					c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				}
+				if (lower.find("bthenum") != umax)
+				{
+					hid_log.trace("%s skipping BTHENUM path: %s", m_type, path);
+					continue;
+				}
+
+				hid_log.trace("%s SetupDi path: %s", m_type, path);
+				device_paths.insert(path);
+
+				// Match hidapi-Windows behaviour: only record serials for PS Move Col01.
+				if (m_type == pad_handler::move && path.find("&Col01#") != umax)
+				{
+					serials[std::move(path)] = {};
+				}
+			}
+
+			SetupDiDestroyDeviceInfoList(dev_info);
+		}
+		else
+		{
+			hid_log.error("SetupDiGetClassDevs failed (%u); falling back to hid_enumerate", GetLastError());
+			for (const auto& [vid, pid] : m_ids)
+			{
+				std::lock_guard lock(g_hid_mutex);
+				hid_device_info* head = hid_enumerate(vid, pid);
+				for (hid_device_info* dev_info = head; dev_info != nullptr; dev_info = dev_info->next)
+				{
+					if (!dev_info->path)
+					{
+						continue;
+					}
+					std::string path = dev_info->path;
+					device_paths.insert(path);
+					serials[std::move(path)] = dev_info->serial_number ? std::wstring(dev_info->serial_number) : std::wstring();
+				}
+				hid_free_enumeration(head);
+			}
+		}
+	}
+#else
 	for (const auto& [vid, pid] : m_ids)
 	{
 		// Let's make sure hid_enumerate is only done one thread at a time
@@ -302,20 +461,14 @@ void hid_pad_handler<Device>::enumerate_devices()
 
 			std::string path = dev_info->path;
 			device_paths.insert(path);
-
-#ifdef _WIN32
-			// Only add serials for col01 ps move device
-			if (m_type == pad_handler::move && path.find("&Col01#") != umax)
-#endif
-			{
-				serials[std::move(path)] = dev_info->serial_number ? std::wstring(dev_info->serial_number) : std::wstring();
-			}
+			serials[std::move(path)] = dev_info->serial_number ? std::wstring(dev_info->serial_number) : std::wstring();
 		}
 		hid_free_enumeration(head);
 #if defined(__APPLE__)
 		}, false);
 #endif
 	}
+#endif
 #endif
 	hid_log.notice("%s enumeration found %d devices (%f ms)", m_type, device_paths.size(), timer.GetElapsedTimeInMilliSec());
 
