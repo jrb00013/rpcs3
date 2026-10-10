@@ -3390,8 +3390,10 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 extern u32 ppu_stcx_wait_for_ppu(u32 addr);
 extern bool ppu_stcx_line_wanted(u32 addr);
 extern bool ppu_stcx_lock_waited(u32 addr);
+extern bool ppu_stcx_campaign_interest(u32 addr);
 extern atomic_t<u64> g_spu_ppu_prio_backoffs;
 extern atomic_t<u64> g_spu_ppu_prio_putllc_deny;
+extern atomic_t<u64> g_putllc_commit_while_interest;
 
 static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
 {
@@ -3443,15 +3445,8 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play19: freeze-20261010 — play18 only denied unchanged writeback while
-			// lock_waiters (adopt_rtime) was held. Live BO2 softlock had Secondary failing
-			// stwcx on 0x2e20880 mostly OUTSIDE adopt (old_data!=data / early rtime miss),
-			// so waiters==0 while want_tsc flickered; deny/locked8 stayed ~0.15 and
-			// line-written/locked8 ran ~0.7–1.1M/10s with FPS stuck. Gate unchanged
-			// writeback on the same ppu_stcx_line_wanted signal as unique-lock PUTLLC
-			// (fresh want_tsc age-cap OR lock_waiters). Sleeping PPU stops calling
-			// note_stcx_fail => want expires => SPURS boot path proceeds (not play14 sticky,
-			// not play17 deny-before-all-mutations).
+			// play20: refuse Accurate unchanged rtime+128 while a PPU retry campaign
+			// owns the line (event-driven interest / adopt waiters — not age-capped want).
 			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
@@ -3462,6 +3457,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// For the comparison, load twice for atomicity
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
 			{
+				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+				{
+					// Invariant breach: deny must cover interest before this CAS.
+					g_putllc_commit_while_interest++;
+				}
+
 				raddr = 0; // Disable notification
 				return true;
 			}
@@ -3469,8 +3470,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// couchlink: refuse unique-lock PUTLLC on a PPU-wanted line (want_tsc age-cap OR
-		// lock_waiters). Same gate as play15/16 for the changed-data path.
+		// play20: refuse unique-lock PUTLLC on the same campaign-interest predicate.
 		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 		{
 			g_spu_ppu_prio_putllc_deny++;
@@ -3541,6 +3541,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		}();
 
 		res += success ? 64 : 0 - 64;
+
+		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+		{
+			g_putllc_commit_while_interest++;
+		}
+
 		return success;
 	}())
 	{
