@@ -3443,14 +3443,16 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play18: Accurate unchanged writeback (CAS rtime+128) is the play16 storm —
-			// it never took unique lock bits, so play16's deny-after-scan never ran and
-			// lock_waiters never armed. Deny ONLY while a starved PPU holds lock_waiters
-			// (adopt_hold for the whole adopt_rtime attempt). Do NOT deny on want_tsc
-			// alone here — that was play17's blanket early deny and can wedge boot when
-			// SPURS needs unchanged PUTLLC while want_tsc is being refreshed. Sleeping
-			// PPU => waiters==0 => this path proceeds (age-cap still covers unique-lock).
-			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_lock_waited(addr))
+			// play19: freeze-20261010 — play18 only denied unchanged writeback while
+			// lock_waiters (adopt_rtime) was held. Live BO2 softlock had Secondary failing
+			// stwcx on 0x2e20880 mostly OUTSIDE adopt (old_data!=data / early rtime miss),
+			// so waiters==0 while want_tsc flickered; deny/locked8 stayed ~0.15 and
+			// line-written/locked8 ran ~0.7–1.1M/10s with FPS stuck. Gate unchanged
+			// writeback on the same ppu_stcx_line_wanted signal as unique-lock PUTLLC
+			// (fresh want_tsc age-cap OR lock_waiters). Sleeping PPU stops calling
+			// note_stcx_fail => want expires => SPURS boot path proceeds (not play14 sticky,
+			// not play17 deny-before-all-mutations).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
 				return false;

@@ -3692,7 +3692,12 @@ bool ppu_stcx_line_wanted(u32 addr)
 		return false;
 	}
 
-	static const u64 deny_cap = std::max<u64>(utils::get_tsc_freq() / 5000, 4000); // ~200 us
+	// play19: 200 us (play15/18) was too short under BO2 co-op — Secondary's stwcx
+	// retry gap often exceeded the cap, SPUs re-took unique lock / unchanged writeback,
+	// and the line stormed (freeze-20261010: ~1.5M stwcx fails/10s on 0x2e20880).
+	// ~1 ms still expires if the PPU sleeps (boot / sys_timer_usleep) without
+	// note_stcx_fail refreshes; not sticky-until-ok (play14 wedge).
+	static const u64 deny_cap = std::max<u64>(utils::get_tsc_freq() / 1000, 20000); // ~1 ms
 	return utils::get_tsc() - want < deny_cap;
 }
 
