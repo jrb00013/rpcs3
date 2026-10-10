@@ -41,6 +41,9 @@ struct cfg_root : cfg::node
 		cfg::_bool accurate_cache_line_stores{ this, "Accurate Cache Line Stores", false };
 		cfg::_bool rsx_accurate_res_access{this, "Accurate RSX reservation access", false, true};
 		cfg::_bool ppu_reservation_priority_over_spu{this, "PPU Reservation Priority Over SPUs", false, true};
+		// couchlink: after 256 consecutive stwcx./stdcx. failures on a line, let a store whose data still equals the lwarx value proceed as a plain CAS.
+		// Breaks false-sharing livelocks (BO2 SPURS) but turns LL/SC into CAS, which can corrupt lock-free code without version counters (ABA). Per-game opt-in.
+		cfg::_bool ppu_starvation_cas_refresh{this, "PPU Starvation CAS Refresh", false, true};
 
 		struct fifo_setting : public cfg::_enum<rsx_fifo_mode>
 		{

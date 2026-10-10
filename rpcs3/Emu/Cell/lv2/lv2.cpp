@@ -1239,6 +1239,9 @@ stx::reset_lock acquire_reset_lock(stx::init_mutex& mtx, ppu_thread* ppu)
 	}, ppu);
 }
 
+// couchlink: see PPUThread.cpp
+extern u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
+
 class ppu_syscall_usage
 {
 	// Internal buffer
@@ -1276,6 +1279,68 @@ public:
 		}
 	}
 
+	// couchlink: on-demand guest thread dump (log-only, never changes emulation, no pause).
+	// Guest "freezes" (wait loops polling sys_timer_usleep, deadlocks) look identical from outside, and
+	// the usleep rate alone cannot tell them from healthy play (MK averages 17-50k/s). So instead of
+	// guessing, let the operator ask: creating <RPCS3 dir>/dump_threads.trigger makes this thread log the
+	// full context of every PPU thread (PC/LR/callstack/syscall+call history) within a second.
+	// Usage: tools/rpcs3-debug/rpcs3-hang-diag.sh --guest   (docs/RPCS3_FREEZES.md)
+	static void dump_guest_threads_if_requested()
+	{
+		static const std::string trigger = fs::get_config_dir() + "dump_threads.trigger";
+
+		if (!fs::is_file(trigger))
+		{
+			return;
+		}
+
+		fs::remove_file(trigger);
+
+		std::string out;
+		u32 count = 0;
+		idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& ppu)
+		{
+			count++;
+			fmt::append(out, "\n--- %s (id=0x%x) ---\n", ppu.get_name(), id);
+			ppu.dump_all(out);
+		});
+
+		u32 spu_count = 0;
+		idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& spu)
+		{
+			spu_count++;
+			fmt::append(out, "\n--- %s (id=0x%x) ---\n", spu.get_name(), id);
+			spu.dump_all(out);
+		});
+
+		// Kernel event queues: queued events and who waits. A thread blocked in sys_event_queue_receive on a queue that has no
+		// events and no producer is a lost notification (MK deadlock 2026-10-02: FMOD thread on the SPURS queue 0x8d00f900).
+		// try_lock only: never block the diagnostics thread on a queue mutex.
+		std::string queues_dump = "\nKernel event queues (id key size queued pq sq):";
+		u32 qcount = 0;
+		idm::select<lv2_obj, lv2_event_queue>([&](u32 id, lv2_event_queue& q)
+		{
+			qcount++;
+			if (q.mutex.try_lock_shared())
+			{
+				fmt::append(queues_dump, "\n\tqueue 0x%x key=0x%llx size=%u queued=%zu pq=%s sq=%s", id, q.key, q.size, q.events.size(), q.pq ? "WAIT" : "-", q.sq ? "WAIT" : "-");
+				q.mutex.unlock_shared();
+			}
+			else
+			{
+				fmt::append(queues_dump, "\n\tqueue 0x%x (mutex busy)", id);
+			}
+		});
+
+		out += queues_dump;
+		fmt::append(out, "\n(%u event queues)", qcount);
+
+		std::string stcx;
+		ppu_report_stcx_failures(stcx, 0, 16);
+
+		ppu_log.error("Guest thread dump requested (dump_threads.trigger): %u PPU threads, %u SPU threads.%s\n\n%s", count, spu_count, out, stcx);
+	}
+
 	void operator()()
 	{
 		bool was_paused = false;
@@ -1284,6 +1349,18 @@ public:
 		for (u32 i = 1; thread_ctrl::state() != thread_state::aborting; i++)
 		{
 			thread_ctrl::wait_until(&sleep_until, 1'000'000);
+
+			dump_guest_threads_if_requested();
+
+			if (i % 10 == 0)
+			{
+				// Heavy PPU reservation contention shows up here even when nobody triggers a dump.
+				std::string stcx;
+				if (ppu_report_stcx_failures(stcx, 20'000, 4) >= 20'000)
+				{
+					ppu_log.warning("PPU reservation contention: %s", stcx);
+				}
+			}
 
 			const bool is_paused = Emu.IsPaused();
 

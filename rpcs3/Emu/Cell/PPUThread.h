@@ -278,6 +278,17 @@ public:
 	};
 
 	atomic_t<ppu_prio_t> prio{};
+
+	// Backported unchanged from upstream (needed by f9b4d121 sys_cond_signal_to fix)
+	bool is_lower_priority_than(ppu_thread& other) const
+	{
+		return prio.load().prio < other.prio.load().prio;
+	}
+
+	bool is_lower_priority_than(s32 _prio) const
+	{
+		return prio.load().prio < _prio;
+	}
 	const u32 stack_size; // Stack size
 	const u32 stack_addr; // Stack address
 
@@ -314,6 +325,10 @@ public:
 	u64 last_ftime = 0;
 	u32 last_faddr = 0;
 	u64 last_fail = 0;
+	// couchlink: consecutive stwcx./stdcx. failures of THIS thread on one 128-byte line (reset on this thread's own success).
+	// A per-line counter shared by all threads never reached the starvation threshold because other threads' successes reset it.
+	u32 stcx_streak = 0;
+	u32 stcx_streak_line = 0;
 	u64 last_succ = 0;
 	u64 exec_bytes = 0; // Amount of "bytes" executed (4 for each instruction)
 

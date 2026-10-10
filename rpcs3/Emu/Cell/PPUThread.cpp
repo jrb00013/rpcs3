@@ -3535,6 +3535,214 @@ extern u64 ppu_ldarx(ppu_thread& ppu, u32 addr)
 	return ppu_load_acquire_reservation<u64>(ppu, addr);
 }
 
+// couchlink: stwcx./stdcx. failure histogram per 128-byte reservation line (diagnostics only, no behavior change).
+// PPU atomics can be starved by SPU GETLLAR/PUTLLC polling of the same line (BO2 lobby stalls, issue #3).
+namespace
+{
+	struct stcx_fail_slot
+	{
+		atomic_t<u32> addr{};
+		atomic_t<u64> count{};
+		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
+		atomic_t<u32> streak{}; // consecutive failures with no success on this line
+		atomic_t<u64> want_tsc{}; // TSC at which a starved PPU asked SPUs to hold off this line; 0 = not waiting
+		// Count of PPU threads currently inside the adopt/lock-wait spin on this line.
+		// PUTLLC deny must stay armed for the whole spin: want_tsc alone is age-capped
+		// (~200 us) for the BO2 boot wedge, but the lock-wait loop runs for up to ~4000
+		// pauses without calling note_stcx_fail — so the age-cap expired mid-spin and
+		// SPUs re-took the line (play15: +1.6M locked8/10s at round ~4 zombies on 0x2e20880).
+		atomic_t<u32> lock_waiters{};
+	};
+
+	std::array<stcx_fail_slot, 4096> s_stcx_fail;
+	std::array<u64, 4096> s_stcx_prev{};
+}
+
+static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
+{
+	// Per-thread streak (drives the starvation refresh / lock wait). The shared per-line table below only feeds diagnostics and the SPU handoff.
+	if (ppu.stcx_streak_line == (addr & -128))
+	{
+		ppu.stcx_streak++;
+	}
+	else
+	{
+		ppu.stcx_streak_line = addr & -128;
+		ppu.stcx_streak = 1;
+	}
+
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	e.addr.release(addr & -128);
+	e.tsc.release(utils::get_tsc());
+
+	if (++e.streak >= 8)
+	{
+		// Starving: ask SPUs to hold off this line until we succeed (see ppu_stcx_wait_for_ppu).
+		e.want_tsc.release(e.tsc.load());
+	}
+
+	e.count++;
+}
+
+static inline void note_stcx_ok(ppu_thread& ppu, u32 addr) noexcept
+{
+	ppu.stcx_streak = 0;
+
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+
+	if (e.streak)
+	{
+		e.streak.release(0);
+		e.want_tsc.release(0);
+	}
+}
+
+// couchlink: progress guarantee for starved PPU atomics (BO2 livelock 2026-10-02: ~250k stdcx. failures/s on one 128-byte line
+// holding several lock-free list heads; the lwarx value was unchanged, so the loser was the reservation-time check, i.e. false
+// sharing with writers to *other* words of the line). After 256 consecutive failures on a line, a stwcx. whose own data still
+// equals the lwarx value adopts the line's current reservation time and proceeds as a plain atomic compare-and-swap.
+// Lock-free code with version counters (like BO2's) is correct under CAS semantics; only code that depends on losing the
+// reservation without any change to its own bytes could differ, and only while already starved. Gated by the option below (it only ever
+// triggers on a starvation streak); counted in g_stcx_refresh.
+// Per-game opt-in via 'PPU Starvation CAS Refresh' (default false): it turns LL/SC into CAS, unsafe for lock-free code without version
+// counters (suspected cause of an MK deadlock when it was always on, 2026-10-02).
+// Consecutive failures on one line before a starved stwcx. adopts the line's reservation time and waits for a held line lock.
+// BO2 freeze 2026-10-04 00:19 (Secondary spinning on a SPURS counter, 49M failures/10 s): the old threshold of 256 was almost never
+// reached. Successes are interleaved (about one per 50 attempts, from the 'locked8' failures plus 'line-written' ones against six
+// SPU kernels), and every success resets the streak, so P(streak >= 256) is ~0.5%: only ~55 refreshes and ~5k lock-waits per 10 s
+// against 49M failures, i.e. the fix engaged on a fraction of a percent of the failing stores. 8 matches the SPU handoff threshold
+// (note_stcx_fail), so by then the SPUs are already holding off this line.
+constexpr u32 stcx_adopt_streak = 8;
+
+atomic_t<u64> g_stcx_refresh{};
+atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock while starved
+
+// Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
+atomic_t<u64> g_spu_ppu_prio_backoffs{};
+// Number of times an SPU PUTLLC refused to take the line lock because want_tsc was still set after the yield window.
+atomic_t<u64> g_spu_ppu_prio_putllc_deny{};
+
+// Why stwcx./stdcx. failed (livelock diagnosis, BO2 2026-10-02: ~250k failures/s on one line):
+//   [0] data differs from the lwarx value (another writer changed the data itself)
+//   [1] reservation time differs (something wrote to the 128-byte line since lwarx, data may be unchanged)
+//   [2] reservation locked/changed at lock time (fetch_op in the 8-byte path)
+//   [3] 128-byte path: already locked or updated
+//   [4] address mismatch with the reservation
+atomic_t<u64> g_stcx_fail_why[5]{};
+
+// Handoff for starved PPU atomics (BO2 SPURS stalls, issue #3). The SPURS kernels poll the same 128-byte lines the PPU
+// updates with lwarx/stwcx. at full speed, so under emulation timing a PPU atomic can lose for minutes and the game, waiting on
+// SPURS services, hangs. When a PPU atomic has failed 8 times in a row on a line it flags the line; an SPU GETLLAR/PUTLLC on that
+// line then pauses until the PPU succeeds (flag cleared) or ~50 us pass, whichever is first. Unlike a fixed sleep (c96e609:
+// 100M back-offs, BO2 ~1 FPS) the SPU only waits as long as the PPU actually needs, and never more than the cap.
+// Returns the number of pause iterations spent (0 = line not flagged).
+//
+// The pause alone is not enough (BO2 freeze 2026-10-04 01:40 on play13): after the ~50 us window the SPU still ran PUTLLC and
+// re-took rsrv_unique_lock while want_tsc was set, producing ~1.66M locked8 failures/10 s even though refreshes/lock-waits were
+// firing. Callers must also refuse to take the line lock while ppu_stcx_line_wanted() is true (see do_putllc).
+u32 ppu_stcx_wait_for_ppu(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+
+	if (e.addr.load() != (addr & -128) || !e.want_tsc.load())
+	{
+		return 0;
+	}
+
+	static const u64 cap = std::max<u64>(utils::get_tsc_freq() / 20000, 1000); // ~50 us
+	const u64 start = utils::get_tsc();
+	u32 spins = 0;
+
+	while (e.want_tsc.load() && utils::get_tsc() - start < cap)
+	{
+		utils::pause();
+		spins++;
+	}
+
+	return spins;
+}
+
+// True while SPUs must refuse PUTLLC on this 128-byte line.
+//
+// Two signals (OR):
+// 1) Fresh want_tsc (~200 us age-cap). Sticky want_tsc until note_stcx_ok wedged BO2 at
+//    load on play14 (PPU asleep in sys_timer_usleep, denies ~586k/10s). Age-cap lets SPURS
+//    through once the PPU walks away; note_stcx_fail refreshes while it keeps failing.
+// 2) lock_waiters > 0 — a starved PPU is inside the adopt/lock-wait spin. That loop does
+//    not call note_stcx_fail, so (1) alone expired mid-spin and SPUs re-locked the line
+//    (play15 mid-match freeze: locked8 +1.6M/10s on 0x2e20880 despite active lock-waits).
+bool ppu_stcx_line_wanted(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+
+	if (e.addr.load() != (addr & -128))
+	{
+		return false;
+	}
+
+	if (e.lock_waiters.load())
+	{
+		return true;
+	}
+
+	const u64 want = e.want_tsc.load();
+
+	if (!want)
+	{
+		return false;
+	}
+
+	static const u64 deny_cap = std::max<u64>(utils::get_tsc_freq() / 5000, 4000); // ~200 us
+	return utils::get_tsc() - want < deny_cap;
+}
+
+// True only while a starved PPU is inside ppu_store_reservation with adopt_rtime
+// (see lock_waiter_hold). Used to gate Accurate-reservations unchanged PUTLLC
+// writebacks without the play17 blanket want_tsc deny that can wedge boot.
+bool ppu_stcx_lock_waited(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && e.lock_waiters.load() != 0;
+}
+
+u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
+
+// Print the hottest failing lines. Delta since the previous call. Returns total failures in the interval.
+u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
+{
+	std::vector<std::pair<u64, u32>> hot;
+	u64 total = 0;
+
+	for (u32 i = 0; i < s_stcx_fail.size(); i++)
+	{
+		const u64 c = s_stcx_fail[i].count;
+		const u64 d = c - s_stcx_prev[i];
+		s_stcx_prev[i] = c;
+
+		if (d)
+		{
+			total += d;
+			hot.emplace_back(d, static_cast<u32>(s_stcx_fail[i].addr));
+		}
+	}
+
+	if (total < min_total)
+	{
+		return total;
+	}
+
+	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
+
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+
+	for (u32 i = 0; i < top && i < hot.size(); i++)
+	{
+		fmt::append(out, "\n\t0x%08x: %llu", hot[i].second, hot[i].first);
+	}
+
+	return total;
+}
+
 template <typename T>
 static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 {
@@ -3550,7 +3758,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 	auto& data = const_cast<atomic_be_t<u64>&>(vm::_ref<atomic_be_t<u64>>(addr & -8));
 	auto& res = vm::reservation_acquire(addr);
-	const u64 rtime = ppu.rtime;
+	u64 rtime = ppu.rtime;
 
 	be_t<u64> old_data = 0;
 	std::memcpy(&old_data, &ppu.rdata[addr & 0x78], sizeof(old_data));
@@ -3587,12 +3795,55 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		}
 	}
 
-	if (old_data != data || rtime != (res & -128))
+	// False-sharing starvation (BO2, issue #3): our 8 bytes are unchanged, only the line's reservation time moved, and it keeps moving
+	// (four SPURS kernels PUTLLC the same line). Once starved, ignore the reservation TIME in BOTH checks below: this one and the
+	// one inside the 8-byte fetch_op, which alone accounted for ~8x more failures ('locked8') than this first check, so relaxing only
+	// this check (the first version) could never break the livelock. The data compare_exchange still guards the store itself, and
+	// a held line lock ((r & 127) != 0) still fails, so this is CAS semantics, not a free pass.
+	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu.stcx_streak >= stcx_adopt_streak && ppu.stcx_streak_line == (addr & -128);
+
+	if (adopt_rtime && rtime != (res & -128))
 	{
+		g_stcx_refresh++;
+	}
+
+	if (old_data != data || (!adopt_rtime && rtime != (res & -128)))
+	{
+		g_stcx_fail_why[old_data != data ? 0 : 1]++;
+		note_stcx_fail(ppu, addr);
 		ppu.raddr = 0;
 		ppu.res_cached = 0;
 		return false;
 	}
+
+	// play18: arm lock_waiters for the whole starved adopt attempt — not only the
+	// unique-lock spin. play16 only incremented while (r & 127), so Accurate SPU
+	// unchanged PUTLLC (CAS rtime+128, no lock bits) never saw waiters and kept
+	// storming the line. Holding waiters here lets do_putllc deny that writeback
+	// without a blanket want_tsc deny (play17 boot wedge). Cleared when this
+	// scope ends (success or fail); sleeping PPU => waiters==0 => SPUs proceed.
+	struct lock_waiter_hold
+	{
+		stcx_fail_slot* e = nullptr;
+		lock_waiter_hold(u32 a, bool arm)
+		{
+			if (!arm)
+			{
+				return;
+			}
+
+			e = &s_stcx_fail[(a >> 7) & 4095];
+			e->addr.release(a & -128);
+			e->lock_waiters++;
+		}
+		~lock_waiter_hold()
+		{
+			if (e)
+			{
+				e->lock_waiters--;
+			}
+		}
+	} adopt_hold{addr, adopt_rtime};
 
 	if ([&]()
 	{
@@ -3612,6 +3863,8 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 			if (!_ok)
 			{
 				// Already locked or updated: give up
+				g_stcx_fail_why[3]++;
+				note_stcx_fail(ppu, addr);
 				return false;
 			}
 
@@ -3639,6 +3892,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 					{
 						data.release(new_data);
 						res += 64;
+						note_stcx_ok(ppu, addr);
 						return true;
 					}
 
@@ -3655,7 +3909,14 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (new_data == old_data)
 		{
 			ppu.last_faddr = 0;
-			return res.compare_and_swap_test(rtime, rtime + 128);
+
+			if (res.compare_and_swap_test(rtime, rtime + 128))
+			{
+				note_stcx_ok(ppu, addr);
+				return true;
+			}
+
+			return false;
 		}
 
 		// Aligned 8-byte reservations will be used here
@@ -3663,20 +3924,50 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 
 		const u64 lock_bits = vm::rsrv_unique_lock;
 
-		auto [_oldd, _ok] = res.fetch_op([&](u64& r)
+		auto try_lock_line = [&]()
 		{
-			if ((r & -128) != rtime || (r & 127))
+			return res.fetch_op([&](u64& r)
 			{
-				return false;
+				if ((!adopt_rtime && (r & -128) != rtime) || (r & 127))
+				{
+					return false;
+				}
+
+				r += lock_bits;
+				return true;
+			});
+		};
+
+		auto lock_result = try_lock_line();
+
+		// couchlink: a starved store (BO2 SPURS, issue #3) that fails only because the line lock is held is waiting on an SPU's PUTLLC
+		// commit, which is a few microseconds and never blocks on us. Wait for it (bounded) instead of failing and retrying at full
+		// speed: BO2 dump 2026-10-03 01:16 showed 500M of these 'locked' failures against 120M 'line-written', i.e. four SPURS
+		// kernels hold the lock almost continuously and the PPU only ever got a lucky instant.
+		// lock_waiters is already held by adopt_hold for the whole adopt_rtime attempt (play18).
+		if (!lock_result.second && adopt_rtime && (lock_result.first & 127))
+		{
+			for (u32 spin = 0; spin < 4000; spin++)
+			{
+				utils::pause();
+				lock_result = try_lock_line();
+
+				if (lock_result.second || !(lock_result.first & 127))
+				{
+					break;
+				}
 			}
 
-			r += lock_bits;
-			return true;
-		});
+			g_stcx_lockwait++;
+		}
+
+		const bool _ok = lock_result.second;
 
 		// Give up if reservation has been locked or updated
 		if (!_ok)
 		{
+			g_stcx_fail_why[2]++;
+			note_stcx_fail(ppu, addr);
 			ppu.last_faddr = 0;
 			return false;
 		}
@@ -3685,6 +3976,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 		if (data.compare_exchange(old_data, new_data))
 		{
 			res += 128 - lock_bits;
+			note_stcx_ok(ppu, addr);
 			return true;
 		}
 

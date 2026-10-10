@@ -22,7 +22,9 @@
 #define VK_FRAGMENT_CONSTANTS_BUFFER_SIZE_M 16
 #define VK_INDEX_RING_BUFFER_SIZE_M 16
 
-#define VK_MAX_ASYNC_CB_COUNT 512
+// Primary/secondary submit rings. 1024 gives BO2 + Multithreaded RSX headroom
+// so next() rarely blocks; the wait path below still prevents present freezes.
+#define VK_MAX_ASYNC_CB_COUNT 1024
 
 #define FRAME_PRESENT_TIMEOUT 10000000ull // 10 seconds
 #define GENERAL_WAIT_TIMEOUT  2000000ull  // 2 seconds
@@ -328,14 +330,47 @@ namespace vk
 
 		inline command_buffer_chunk* next()
 		{
-			const auto result_id = ++m_current_index % Count;
-			auto result = &m_cb_list[result_id];
-
-			if (!result->poke())
+			// Prefer any free CB in the ring before blocking.
+			// Upstream returned a still-pending CB when poke() failed — BO2 + MT RSX
+			// flooded the ring and froze presents. Wait only when every slot is busy.
+			for (u32 attempt = 0; attempt < Count; ++attempt)
 			{
-				rsx_log.error("CB chain has run out of free entries!");
+				const auto result_id = ++m_current_index % Count;
+				auto result = &m_cb_list[result_id];
+
+				if (result->poke())
+				{
+					return result;
+				}
 			}
 
+			// Kick fence flush on every in-flight CB, then retry — often one has
+			// already retired on the GPU and poke succeeds without a hard wait.
+			for (auto& cb : m_cb_list)
+			{
+				cb.flush();
+			}
+			for (u32 attempt = 0; attempt < Count; ++attempt)
+			{
+				const auto result_id = ++m_current_index % Count;
+				auto result = &m_cb_list[result_id];
+				if (result->poke())
+				{
+					return result;
+				}
+			}
+
+			// Entire chain still in flight — reclaim the next slot with a bounded wait.
+			const auto result_id = ++m_current_index % Count;
+			auto result = &m_cb_list[result_id];
+			rsx_log.warning("CB chain exhausted - waiting for a free entry");
+			result->flush();
+			result->wait(FRAME_PRESENT_TIMEOUT);
+			if (!result->poke())
+			{
+				// Fence did not retire in time — last-resort hard wait.
+				result->wait();
+			}
 			return result;
 		}
 

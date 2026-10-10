@@ -759,7 +759,9 @@ namespace vk
 		dlg->set_limit(0, limit1);
 		dlg->set_limit(1, limit2);
 
-		atomic_t<u32> ctr = 0;
+		// Shared with the queued callbacks: if we give up waiting below, jobs that are
+		// still in flight must not write to a dead stack frame.
+		auto ctr = std::make_shared<atomic_t<u32>>(0);
 		for (const auto& props : pipe_properties)
 		{
 			for (auto& variant : variants.base_pipelines)
@@ -768,23 +770,44 @@ namespace vk
 				key.properties = props;
 				key.compiler_opt = variant.first | variant.second;
 
-				link(props, variant.first | variant.second, true, [&](std::shared_ptr<glsl::program>&) { ctr++; });
+				link(props, variant.first | variant.second, true, [ctr](std::shared_ptr<glsl::program>&) { (*ctr)++; });
 			}
 		}
 
 		// Drain the queue.
 		// FIXME: Since the queue is executing from the context of the pipe compiler, we cannot properly stop this process.
+		// A worker can stall inside the driver (observed: boot stuck at "Building base variant N of M" forever with idle CPU).
+		// Never let that block boot: give up when no variant completes for a long time. Anything not
+		// precompiled is built on demand by get() (inline link on cache miss), so this only costs warm-up.
+		constexpr auto stall_timeout = 30s;
+		bool precompile_complete = true;
+		u32 last_completed = 0;
+		auto last_progress = std::chrono::steady_clock::now();
+
 		do
 		{
 			std::this_thread::sleep_for(16ms);
 
-			const auto completed = ctr.load();
+			const auto completed = ctr->load();
 			dlg->update_msg(0, get_localized_string(localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_VULKAN, "%u %s %u", completed, get_localized_string(localized_string_id::PROGRESS_DIALOG_OF), limit1));
 			dlg->set_value(0, completed);
-		}
-		while (ctr.load() < limit1);
 
-		ctr = 0;
+			const auto now = std::chrono::steady_clock::now();
+			if (completed != last_completed)
+			{
+				last_completed = completed;
+				last_progress = now;
+			}
+			else if (now - last_progress > stall_timeout)
+			{
+				rsx_log.error("Interpreter precompile stalled at %u of %u variants for %llus. Skipping the remainder; variants will be compiled on demand.",
+					completed, limit1, static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(stall_timeout).count()));
+				precompile_complete = false;
+				break;
+			}
+		}
+		while (ctr->load() < limit1);
+
 		std::lock_guard lock(m_program_cache_lock);
 
 		for (const auto& props : pipe_properties)
@@ -808,7 +831,12 @@ namespace vk
 				compat_key.compiler_opt = variant.vs_opts.compatible_shader_opts | variant.fs_opts.compatible_shader_opts;
 				auto found = m_program_cache.find(compat_key);
 
-				ensure(found != m_program_cache.end(), "Invalid interpreter configuration.");
+				if (found == m_program_cache.end())
+				{
+					// Only legitimate if the precompile above was cut short. Otherwise the variant set is inconsistent.
+					ensure(!precompile_complete, "Invalid interpreter configuration.");
+					continue;
+				}
 
 				pipeline_cache_entry_t cache_entry
 				{
