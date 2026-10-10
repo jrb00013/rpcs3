@@ -2650,8 +2650,16 @@ void ppu_thread::cpu_task()
 	}
 }
 
+// Forward decl — defined with the stcx starvation table below.
+static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept;
+
 void ppu_thread::cpu_sleep()
 {
+	// play20: leaving the run queue ends any stwcx retry campaign. Clear interest so
+	// SPURS unchanged/unique PUTLLC can proceed (play14 boot wedge was sticky interest
+	// while PPUs slept in sys_timer_usleep). Do this before dropping the reservation.
+	ppu_stcx_release_campaign(*this);
+
 	// Clear reservation
 	raddr = 0;
 
@@ -3399,6 +3407,12 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 		fmt::throw_exception("PPU %s: Unaligned address: 0x%08x", sizeof(T) == 4 ? "LWARX" : "LDARX", addr);
 	}
 
+	// play20: lwarx to a different line ends the previous stwcx campaign.
+	if (ppu.stcx_streak_line && (addr & -128) != ppu.stcx_streak_line)
+	{
+		ppu_stcx_release_campaign(ppu);
+	}
+
 	// Always load aligned 64-bit value
 	auto& data = vm::_ref<const atomic_be_t<u64>>(addr & -8);
 	const u64 size_off = (sizeof(T) * 8) & 63;
@@ -3545,17 +3559,42 @@ namespace
 		atomic_t<u64> count{};
 		atomic_t<u64> tsc{}; // TSC of the most recent failure on this line
 		atomic_t<u32> streak{}; // consecutive failures with no success on this line
-		atomic_t<u64> want_tsc{}; // TSC at which a starved PPU asked SPUs to hold off this line; 0 = not waiting
+		// Courtesy yield hint for ppu_stcx_wait_for_ppu only — NOT the PUTLLC deny predicate.
+		atomic_t<u64> want_tsc{};
 		// Count of PPU threads currently inside the adopt/lock-wait spin on this line.
-		// PUTLLC deny must stay armed for the whole spin: want_tsc alone is age-capped
-		// (~200 us) for the BO2 boot wedge, but the lock-wait loop runs for up to ~4000
-		// pauses without calling note_stcx_fail — so the age-cap expired mid-spin and
-		// SPUs re-took the line (play15: +1.6M locked8/10s at round ~4 zombies on 0x2e20880).
 		atomic_t<u32> lock_waiters{};
+		// play20: event-driven campaign interest. Set when a PPU is actively retrying a
+		// starved stwcx on this line (streak>=8). Cleared on stwcx success, line-switch
+		// lwarx, or real PPU sleep (cpu_sleep) — never by wall-clock TTL.
+		// Age-capped want_tsc (play15–19) is a bandaid: mid-match gaps > TTL reopen the
+		// PUTLLC storm; sticky-until-ok (play14) wedges boot when the PPU sleeps.
+		atomic_t<u32> interest{};
 	};
 
 	std::array<stcx_fail_slot, 4096> s_stcx_fail;
 	std::array<u64, 4096> s_stcx_prev{};
+}
+
+static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept
+{
+	const u32 line = ppu.stcx_streak_line;
+
+	if (!line)
+	{
+		return;
+	}
+
+	auto& e = s_stcx_fail[(line >> 7) & 4095];
+
+	if (e.addr.load() == line)
+	{
+		e.interest.release(0);
+		e.want_tsc.release(0);
+		e.streak.release(0);
+	}
+
+	ppu.stcx_streak = 0;
+	ppu.stcx_streak_line = 0;
 }
 
 static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
@@ -3567,6 +3606,12 @@ static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 	}
 	else
 	{
+		// Switched lines: drop any campaign on the previous line before arming this one.
+		if (ppu.stcx_streak_line)
+		{
+			ppu_stcx_release_campaign(ppu);
+		}
+
 		ppu.stcx_streak_line = addr & -128;
 		ppu.stcx_streak = 1;
 	}
@@ -3577,7 +3622,9 @@ static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 
 	if (++e.streak >= 8)
 	{
-		// Starving: ask SPUs to hold off this line until we succeed (see ppu_stcx_wait_for_ppu).
+		// Campaign start: SPUs must refuse PUTLLC on this line until success or sleep
+		// (see ppu_stcx_line_wanted). want_tsc remains a short courtesy yield hint only.
+		e.interest.release(1);
 		e.want_tsc.release(e.tsc.load());
 	}
 
@@ -3587,13 +3634,15 @@ static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 static inline void note_stcx_ok(ppu_thread& ppu, u32 addr) noexcept
 {
 	ppu.stcx_streak = 0;
+	ppu.stcx_streak_line = 0;
 
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 
-	if (e.streak)
+	if (e.addr.load() == (addr & -128))
 	{
 		e.streak.release(0);
 		e.want_tsc.release(0);
+		e.interest.release(0);
 	}
 }
 
@@ -3619,8 +3668,11 @@ atomic_t<u64> g_stcx_lockwait{}; // stores that had to wait for a held line lock
 
 // Number of times an SPU backed off a line because a PPU stwcx./stdcx. recently failed on it.
 atomic_t<u64> g_spu_ppu_prio_backoffs{};
-// Number of times an SPU PUTLLC refused to take the line lock because want_tsc was still set after the yield window.
+// Number of times an SPU PUTLLC refused to take the line lock because campaign interest was set.
 atomic_t<u64> g_spu_ppu_prio_putllc_deny{};
+// Protocol invariant: successful Accurate PUTLLC reservation mutation while interest(L)==1.
+// Must stay 0. Any increment means deny failed to cover a live PPU retry campaign.
+atomic_t<u64> g_putllc_commit_while_interest{};
 
 // Why stwcx./stdcx. failed (livelock diagnosis, BO2 2026-10-02: ~250k failures/s on one line):
 //   [0] data differs from the lwarx value (another writer changed the data itself)
@@ -3662,15 +3714,13 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	return spins;
 }
 
-// True while SPUs must refuse PUTLLC on this 128-byte line.
+// True while SPUs must refuse PUTLLC on this 128-byte line (play20).
 //
-// Two signals (OR):
-// 1) Fresh want_tsc (~200 us age-cap). Sticky want_tsc until note_stcx_ok wedged BO2 at
-//    load on play14 (PPU asleep in sys_timer_usleep, denies ~586k/10s). Age-cap lets SPURS
-//    through once the PPU walks away; note_stcx_fail refreshes while it keeps failing.
-// 2) lock_waiters > 0 — a starved PPU is inside the adopt/lock-wait spin. That loop does
-//    not call note_stcx_fail, so (1) alone expired mid-spin and SPUs re-locked the line
-//    (play15 mid-match freeze: locked8 +1.6M/10s on 0x2e20880 despite active lock-waits).
+// Event-driven campaign interest (OR lock_waiters during adopt spin):
+// - Armed: note_stcx_fail when shared streak >= 8 (PPU actively retrying this line)
+// - Cleared: note_stcx_ok, lwarx to a different line, or cpu_sleep (real PPU sleep)
+// No wall-clock TTL. Age-capped want_tsc (play15–19) leaked mid-match; sticky-until-ok
+// (play14) wedged boot. Sleep-clear is the liveness half of the protocol.
 bool ppu_stcx_line_wanted(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
@@ -3680,29 +3730,20 @@ bool ppu_stcx_line_wanted(u32 addr)
 		return false;
 	}
 
-	if (e.lock_waiters.load())
-	{
-		return true;
-	}
-
-	const u64 want = e.want_tsc.load();
-
-	if (!want)
-	{
-		return false;
-	}
-
-	static const u64 deny_cap = std::max<u64>(utils::get_tsc_freq() / 5000, 4000); // ~200 us
-	return utils::get_tsc() - want < deny_cap;
+	return e.interest.load() != 0 || e.lock_waiters.load() != 0;
 }
 
-// True only while a starved PPU is inside ppu_store_reservation with adopt_rtime
-// (see lock_waiter_hold). Used to gate Accurate-reservations unchanged PUTLLC
-// writebacks without the play17 blanket want_tsc deny that can wedge boot.
+// True only while a starved PPU is inside ppu_store_reservation with adopt_rtime.
 bool ppu_stcx_lock_waited(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 	return e.addr.load() == (addr & -128) && e.lock_waiters.load() != 0;
+}
+
+bool ppu_stcx_campaign_interest(u32 addr)
+{
+	auto& e = s_stcx_fail[(addr >> 7) & 4095];
+	return e.addr.load() == (addr & -128) && e.interest.load() != 0;
 }
 
 u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top);
@@ -3733,7 +3774,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; commit-while-interest=%llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_putllc_commit_while_interest.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
