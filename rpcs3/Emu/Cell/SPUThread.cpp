@@ -3445,7 +3445,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play20: refuse Accurate unchanged rtime+128 while a PPU retry campaign
+			// play20/21: refuse Accurate unchanged rtime+128 while a PPU retry campaign
 			// owns the line (event-driven interest / adopt waiters — not age-capped want).
 			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
@@ -3459,7 +3459,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			{
 				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
 				{
-					// Invariant breach: deny must cover interest before this CAS.
+					// Invariant breach: Accurate-unchanged deny must cover interest before this CAS.
 					g_putllc_commit_while_interest++;
 				}
 
@@ -3470,12 +3470,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// play20: refuse unique-lock PUTLLC on the same campaign-interest predicate.
-		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
-		{
-			g_spu_ppu_prio_putllc_deny++;
-			return false;
-		}
+		// play21: do NOT refuse unique-lock PUTLLC on campaign interest.
+		// play20 did, and zombies softlocked (freeze-zombies-play20): FPS stuck ~49.95,
+		// 0x2e20880 ~1.5–2M stwcx fails/10s, PUTLLC denies climbing, commit-while-interest
+		// to 1.4M+ (deny missed races) while locked8 dominated — SPUs and PPU deadlocked
+		// each other. Unique-lock commits are real progress; only Accurate-unchanged
+		// writebacks are the false-sharing storm we must block.
 
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
@@ -3542,10 +3542,8 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		res += success ? 64 : 0 - 64;
 
-		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
-		{
-			g_putllc_commit_while_interest++;
-		}
+		// play21: unique-lock success while interest is allowed (see deny removal above).
+		// Do not treat it as commit-while-interest — that counter is Accurate-unchanged only.
 
 		return success;
 	}())

@@ -3714,13 +3714,14 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	return spins;
 }
 
-// True while SPUs must refuse PUTLLC on this 128-byte line (play20).
+// True while SPUs must refuse Accurate-unchanged PUTLLC on this 128-byte line (play21).
 //
 // Event-driven campaign interest (OR lock_waiters during adopt spin):
 // - Armed: note_stcx_fail when shared streak >= 8 (PPU actively retrying this line)
-// - Cleared: note_stcx_ok, lwarx to a different line, or cpu_sleep (real PPU sleep)
-// No wall-clock TTL. Age-capped want_tsc (play15–19) leaked mid-match; sticky-until-ok
-// (play14) wedged boot. Sleep-clear is the liveness half of the protocol.
+// - Cleared: note_stcx_ok, lwarx to a different line, cpu_sleep (real PPU sleep),
+//   or play21 orphan decay (~1ms with no lock_waiters and no fresh fail tsc)
+// play20 had no TTL and also denied unique-lock PUTLLC → zombies softlock on 0x2e20880
+// (freeze-zombies-play20 / 2026-10-11). Decay is only for orphan interest, not mid-adopt.
 bool ppu_stcx_line_wanted(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
@@ -3730,7 +3731,30 @@ bool ppu_stcx_line_wanted(u32 addr)
 		return false;
 	}
 
-	return e.interest.load() != 0 || e.lock_waiters.load() != 0;
+	if (e.lock_waiters.load() != 0)
+	{
+		return true;
+	}
+
+	if (e.interest.load() != 0)
+	{
+		// Orphan interest: no PPU in adopt spin. If the last fail is older than ~1ms,
+		// drop the campaign so SPUs can move (zombies mode-transition livelock).
+		static const u64 orphan_cap = std::max<u64>(utils::get_tsc_freq() / 1000, 1000); // ~1 ms
+		const u64 last = e.tsc.load();
+		const u64 now = utils::get_tsc();
+
+		if (last && now - last >= orphan_cap)
+		{
+			e.interest.release(0);
+			e.streak.release(0);
+			return false;
+		}
+
+		return true;
+	}
+
+	return false;
 }
 
 // True only while a starved PPU is inside ppu_store_reservation with adopt_rtime.
