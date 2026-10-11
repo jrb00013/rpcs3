@@ -3390,8 +3390,10 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 extern u32 ppu_stcx_wait_for_ppu(u32 addr);
 extern bool ppu_stcx_line_wanted(u32 addr);
 extern bool ppu_stcx_lock_waited(u32 addr);
+extern bool ppu_stcx_campaign_interest(u32 addr);
 extern atomic_t<u64> g_spu_ppu_prio_backoffs;
 extern atomic_t<u64> g_spu_ppu_prio_putllc_deny;
+extern atomic_t<u64> g_putllc_commit_while_interest;
 
 static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
 {
@@ -3443,14 +3445,9 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play18: Accurate unchanged writeback (CAS rtime+128) is the play16 storm —
-			// it never took unique lock bits, so play16's deny-after-scan never ran and
-			// lock_waiters never armed. Deny ONLY while a starved PPU holds lock_waiters
-			// (adopt_hold for the whole adopt_rtime attempt). Do NOT deny on want_tsc
-			// alone here — that was play17's blanket early deny and can wedge boot when
-			// SPURS needs unchanged PUTLLC while want_tsc is being refreshed. Sleeping
-			// PPU => waiters==0 => this path proceeds (age-cap still covers unique-lock).
-			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_lock_waited(addr))
+			// play20/21: refuse Accurate unchanged rtime+128 while a PPU retry campaign
+			// owns the line (event-driven interest / adopt waiters — not age-capped want).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
 				return false;
@@ -3460,6 +3457,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// For the comparison, load twice for atomicity
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
 			{
+				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+				{
+					// Invariant breach: Accurate-unchanged deny must cover interest before this CAS.
+					g_putllc_commit_while_interest++;
+				}
+
 				raddr = 0; // Disable notification
 				return true;
 			}
@@ -3467,13 +3470,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// couchlink: refuse unique-lock PUTLLC on a PPU-wanted line (want_tsc age-cap OR
-		// lock_waiters). Same gate as play15/16 for the changed-data path.
-		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
-		{
-			g_spu_ppu_prio_putllc_deny++;
-			return false;
-		}
+		// play21: do NOT refuse unique-lock PUTLLC on campaign interest.
+		// play20 did, and zombies softlocked (freeze-zombies-play20): FPS stuck ~49.95,
+		// 0x2e20880 ~1.5–2M stwcx fails/10s, PUTLLC denies climbing, commit-while-interest
+		// to 1.4M+ (deny missed races) while locked8 dominated — SPUs and PPU deadlocked
+		// each other. Unique-lock commits are real progress; only Accurate-unchanged
+		// writebacks are the false-sharing storm we must block.
 
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
@@ -3539,6 +3541,10 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		}();
 
 		res += success ? 64 : 0 - 64;
+
+		// play21: unique-lock success while interest is allowed (see deny removal above).
+		// Do not treat it as commit-while-interest — that counter is Accurate-unchanged only.
+
 		return success;
 	}())
 	{
