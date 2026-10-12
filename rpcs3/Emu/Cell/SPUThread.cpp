@@ -3445,8 +3445,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play20/21: refuse Accurate unchanged rtime+128 while a PPU retry campaign
-			// owns the line (event-driven interest / adopt waiters — not age-capped want).
+			// Refuse Accurate unchanged rtime+128 while a PPU retry campaign owns the line.
 			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
@@ -3455,6 +3454,13 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 			// Writeback of unchanged data. Only check memory change
 			// For the comparison, load twice for atomicity
+			// play23: re-check wanted immediately before CAS (close commit-while-interest race).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				g_spu_ppu_prio_putllc_deny++;
+				return false;
+			}
+
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
 			{
 				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
@@ -3470,13 +3476,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// play22: refuse unique-lock PUTLLC while the line is wanted (interest OR
-		// lock_waiters). Same deny as play20 — that was the correct half for Secondary's
-		// SPURS counter stwcx (0x73d5ac / wait 0x73d6f8). play20 died because interest
-		// had no TTL and stuck forever (zombies on 0x2e20880). play21 removed the deny
-		// entirely so orphans could move, but Secondary then lost mid-campaign to SPU
-		// unique-lock commits. Forward fix: keep play21+ orphan decay in
-		// ppu_stcx_line_wanted (~16ms) AND restore the unique-lock deny on that predicate.
+		// play22/23: refuse unique-lock PUTLLC while the line is wanted.
 		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 		{
 			g_spu_ppu_prio_putllc_deny++;
@@ -3505,6 +3505,15 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
+		// play23: PPU may have armed interest between the pre-lock deny and fetch_op.
+		// Abort without writing (release unique-lock via res += -64).
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			res += 0 - 64;
+			g_spu_ppu_prio_putllc_deny++;
+			return false;
+		}
+
 		if (!g_cfg.core.spu_accurate_reservations)
 		{
 			if (addr - spurs_addr <= 0x80)
@@ -3525,6 +3534,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// Full lock (heavyweight)
 			// TODO: vm::check_addr
 			vm::writer_lock lock(addr, range_lock);
+
+			// play23: final gate under the writer lock before mutating the line.
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				return false;
+			}
 
 			if (cmp_rdata(rdata, super_data))
 			{
@@ -3548,8 +3563,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		res += success ? 64 : 0 - 64;
 
-		// Protocol invariant: unique-lock commit must not land while line_wanted.
-		// Non-zero means deny raced; orphan decay should make this rare vs play20.
+		if (!success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+		}
+
+		// Protocol invariant: unique-lock commit must not land while interest is set.
 		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
 		{
 			g_putllc_commit_while_interest++;
