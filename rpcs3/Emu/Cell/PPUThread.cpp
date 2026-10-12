@@ -2652,13 +2652,17 @@ void ppu_thread::cpu_task()
 
 // Forward decl — defined with the stcx starvation table below.
 static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept;
+static void ppu_stcx_touch_campaign_on_sleep(ppu_thread& ppu) noexcept;
 
 void ppu_thread::cpu_sleep()
 {
-	// play20: leaving the run queue ends any stwcx retry campaign. Clear interest so
-	// SPURS unchanged/unique PUTLLC can proceed (play14 boot wedge was sticky interest
-	// while PPUs slept in sys_timer_usleep). Do this before dropping the reservation.
-	ppu_stcx_release_campaign(*this);
+	// play23: do NOT clear campaign interest on sleep — refresh its TTL instead.
+	// play22 freeze 2026-10-11-233831: Secondary sits in _sys_lwcond_queue_wait (from
+	// 0x73d640) while main spins at 0x73d7a8. Sleep cleared interest → SPUs unique-lock
+	// → commit-while-interest ~1.9M → Secondary never finishes the SPURS counter.
+	// play14 boot wedge was sticky-forever interest; play23 orphan decay (~100ms after
+	// last fail OR last sleep-touch) is the only TTL so boot/idle still release.
+	ppu_stcx_touch_campaign_on_sleep(*this);
 
 	// Clear reservation
 	raddr = 0;
@@ -3565,10 +3569,9 @@ namespace
 		atomic_t<u32> lock_waiters{};
 		// Event-driven campaign interest. Set when a PPU is actively retrying a
 		// starved stwcx on this line (streak>=8). Cleared on stwcx success, line-switch
-		// lwarx, real PPU sleep (cpu_sleep), or play22 orphan decay (~16ms with no
-		// lock_waiters — liveness only; not a mid-adopt TTL). play20 had no orphan
-		// decay and unique-lock deny stuck forever on zombies; play21 decayed but
-		// dropped the deny. Age-capped want_tsc (play15–19) is still only a yield hint.
+		// lwarx, or orphan decay (~100ms, no lock_waiters). play23 does NOT clear on
+		// cpu_sleep (Secondary lwcond waits must keep SPU deny). play14 sticky-forever
+		// wedged boot; decay is the liveness half. Age-capped want_tsc is yield-only.
 		atomic_t<u32> interest{};
 	};
 
@@ -3596,6 +3599,28 @@ static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept
 
 	ppu.stcx_streak = 0;
 	ppu.stcx_streak_line = 0;
+}
+
+// play23: keep SPU deny alive across brief PPU sleeps (lwcond / usleep) by bumping
+// the campaign's last-activity tsc. Orphan decay still drops interest ~100ms after
+// the last fail or touch — no sticky-forever play14 wedge.
+static void ppu_stcx_touch_campaign_on_sleep(ppu_thread& ppu) noexcept
+{
+	const u32 line = ppu.stcx_streak_line;
+
+	if (!line)
+	{
+		return;
+	}
+
+	auto& e = s_stcx_fail[(line >> 7) & 4095];
+
+	if (e.addr.load() == line && e.interest.load() != 0)
+	{
+		const u64 now = utils::get_tsc();
+		e.tsc.release(now);
+		e.want_tsc.release(now);
+	}
 }
 
 static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
@@ -3702,7 +3727,12 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 		return 0;
 	}
 
-	static const u64 cap = std::max<u64>(utils::get_tsc_freq() / 20000, 1000); // ~50 us
+	// play23: ~200 us when campaign interest is live (Secondary needs a real window);
+	// keep ~50 us courtesy when only want_tsc hint remains.
+	const bool hot = e.interest.load() != 0 || e.lock_waiters.load() != 0;
+	static const u64 cap_hot = std::max<u64>(utils::get_tsc_freq() / 5000, 1000);  // ~200 us
+	static const u64 cap_cool = std::max<u64>(utils::get_tsc_freq() / 20000, 1000); // ~50 us
+	const u64 cap = hot ? cap_hot : cap_cool;
 	const u64 start = utils::get_tsc();
 	u32 spins = 0;
 
@@ -3716,15 +3746,16 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 }
 
 // True while SPUs must refuse PUTLLC on this 128-byte line (Accurate-unchanged AND
-// unique-lock — play22 restores unique-lock deny on this same predicate).
+// unique-lock).
 //
 // Event-driven campaign interest (OR lock_waiters during adopt spin):
 // - Armed: note_stcx_fail when shared streak >= 8 (PPU actively retrying this line)
-// - Cleared: note_stcx_ok, lwarx to a different line, cpu_sleep (real PPU sleep),
-//   or orphan decay (~16ms with no lock_waiters and no fresh fail tsc)
+// - Cleared: note_stcx_ok, lwarx to a different line, or orphan decay (~100ms)
 // play20: unique-lock deny + no TTL → zombies softlock on 0x2e20880.
-// play21: 1ms orphan decay, dropped unique-lock deny → Secondary still starved at 0x73d6f8.
-// play22: unique-lock deny back + ~16ms orphan decay (forward fix, not a revert).
+// play21: 1ms orphan decay, dropped unique-lock deny → Secondary starved at 0x73d6f8.
+// play22: unique-lock deny + 16ms decay, but cpu_sleep cleared interest during
+//   Secondary's lwcond wait → commit-while-interest ~1.9M (freeze-20261011-233831).
+// play23: keep deny; do not clear on sleep; orphan decay ~100ms.
 // Decay is only for orphan interest, not mid-adopt.
 bool ppu_stcx_line_wanted(u32 addr)
 {
@@ -3742,10 +3773,10 @@ bool ppu_stcx_line_wanted(u32 addr)
 
 	if (e.interest.load() != 0)
 	{
-		// Orphan interest: no PPU in adopt spin. If the last fail is older than ~16ms
-		// (~1 frame), drop the campaign so SPUs can move (zombies mode-transition).
-		// play21's 1ms cap flickered too fast under BO2's interleaved success pattern.
-		static const u64 orphan_cap = std::max<u64>(utils::get_tsc_freq() / 60, 1000); // ~16.7 ms
+		// Orphan interest: no PPU in adopt spin. Last fail older than ~100ms → drop so
+		// SPUs can move (zombies mode-transition / boot idle). Must outlast Secondary's
+		// typical lwcond waits inside the 0x73d6** SPURS completion path.
+		static const u64 orphan_cap = std::max<u64>(utils::get_tsc_freq() / 10, 1000); // ~100 ms
 		const u64 last = e.tsc.load();
 		const u64 now = utils::get_tsc();
 
