@@ -3563,11 +3563,12 @@ namespace
 		atomic_t<u64> want_tsc{};
 		// Count of PPU threads currently inside the adopt/lock-wait spin on this line.
 		atomic_t<u32> lock_waiters{};
-		// play20: event-driven campaign interest. Set when a PPU is actively retrying a
+		// Event-driven campaign interest. Set when a PPU is actively retrying a
 		// starved stwcx on this line (streak>=8). Cleared on stwcx success, line-switch
-		// lwarx, or real PPU sleep (cpu_sleep) — never by wall-clock TTL.
-		// Age-capped want_tsc (play15–19) is a bandaid: mid-match gaps > TTL reopen the
-		// PUTLLC storm; sticky-until-ok (play14) wedges boot when the PPU sleeps.
+		// lwarx, real PPU sleep (cpu_sleep), or play22 orphan decay (~16ms with no
+		// lock_waiters — liveness only; not a mid-adopt TTL). play20 had no orphan
+		// decay and unique-lock deny stuck forever on zombies; play21 decayed but
+		// dropped the deny. Age-capped want_tsc (play15–19) is still only a yield hint.
 		atomic_t<u32> interest{};
 	};
 
@@ -3714,14 +3715,17 @@ u32 ppu_stcx_wait_for_ppu(u32 addr)
 	return spins;
 }
 
-// True while SPUs must refuse Accurate-unchanged PUTLLC on this 128-byte line (play21).
+// True while SPUs must refuse PUTLLC on this 128-byte line (Accurate-unchanged AND
+// unique-lock — play22 restores unique-lock deny on this same predicate).
 //
 // Event-driven campaign interest (OR lock_waiters during adopt spin):
 // - Armed: note_stcx_fail when shared streak >= 8 (PPU actively retrying this line)
 // - Cleared: note_stcx_ok, lwarx to a different line, cpu_sleep (real PPU sleep),
-//   or play21 orphan decay (~1ms with no lock_waiters and no fresh fail tsc)
-// play20 had no TTL and also denied unique-lock PUTLLC → zombies softlock on 0x2e20880
-// (freeze-zombies-play20 / 2026-10-11). Decay is only for orphan interest, not mid-adopt.
+//   or orphan decay (~16ms with no lock_waiters and no fresh fail tsc)
+// play20: unique-lock deny + no TTL → zombies softlock on 0x2e20880.
+// play21: 1ms orphan decay, dropped unique-lock deny → Secondary still starved at 0x73d6f8.
+// play22: unique-lock deny back + ~16ms orphan decay (forward fix, not a revert).
+// Decay is only for orphan interest, not mid-adopt.
 bool ppu_stcx_line_wanted(u32 addr)
 {
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
@@ -3738,9 +3742,10 @@ bool ppu_stcx_line_wanted(u32 addr)
 
 	if (e.interest.load() != 0)
 	{
-		// Orphan interest: no PPU in adopt spin. If the last fail is older than ~1ms,
-		// drop the campaign so SPUs can move (zombies mode-transition livelock).
-		static const u64 orphan_cap = std::max<u64>(utils::get_tsc_freq() / 1000, 1000); // ~1 ms
+		// Orphan interest: no PPU in adopt spin. If the last fail is older than ~16ms
+		// (~1 frame), drop the campaign so SPUs can move (zombies mode-transition).
+		// play21's 1ms cap flickered too fast under BO2's interleaved success pattern.
+		static const u64 orphan_cap = std::max<u64>(utils::get_tsc_freq() / 60, 1000); // ~16.7 ms
 		const u64 last = e.tsc.load();
 		const u64 now = utils::get_tsc();
 

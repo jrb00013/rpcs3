@@ -3470,12 +3470,18 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// play21: do NOT refuse unique-lock PUTLLC on campaign interest.
-		// play20 did, and zombies softlocked (freeze-zombies-play20): FPS stuck ~49.95,
-		// 0x2e20880 ~1.5–2M stwcx fails/10s, PUTLLC denies climbing, commit-while-interest
-		// to 1.4M+ (deny missed races) while locked8 dominated — SPUs and PPU deadlocked
-		// each other. Unique-lock commits are real progress; only Accurate-unchanged
-		// writebacks are the false-sharing storm we must block.
+		// play22: refuse unique-lock PUTLLC while the line is wanted (interest OR
+		// lock_waiters). Same deny as play20 — that was the correct half for Secondary's
+		// SPURS counter stwcx (0x73d5ac / wait 0x73d6f8). play20 died because interest
+		// had no TTL and stuck forever (zombies on 0x2e20880). play21 removed the deny
+		// entirely so orphans could move, but Secondary then lost mid-campaign to SPU
+		// unique-lock commits. Forward fix: keep play21+ orphan decay in
+		// ppu_stcx_line_wanted (~16ms) AND restore the unique-lock deny on that predicate.
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+			return false;
+		}
 
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
@@ -3542,8 +3548,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		res += success ? 64 : 0 - 64;
 
-		// play21: unique-lock success while interest is allowed (see deny removal above).
-		// Do not treat it as commit-while-interest — that counter is Accurate-unchanged only.
+		// Protocol invariant: unique-lock commit must not land while line_wanted.
+		// Non-zero means deny raced; orphan decay should make this rare vs play20.
+		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+		{
+			g_putllc_commit_while_interest++;
+		}
 
 		return success;
 	}())
