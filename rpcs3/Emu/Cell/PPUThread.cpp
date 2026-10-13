@@ -2651,7 +2651,6 @@ void ppu_thread::cpu_task()
 }
 
 // Forward decl — defined with the stcx starvation table below.
-static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept;
 static void ppu_stcx_touch_campaign_on_sleep(ppu_thread& ppu) noexcept;
 
 void ppu_thread::cpu_sleep()
@@ -3411,12 +3410,6 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 		fmt::throw_exception("PPU %s: Unaligned address: 0x%08x", sizeof(T) == 4 ? "LWARX" : "LDARX", addr);
 	}
 
-	// play20: lwarx to a different line ends the previous stwcx campaign.
-	if (ppu.stcx_streak_line && (addr & -128) != ppu.stcx_streak_line)
-	{
-		ppu_stcx_release_campaign(ppu);
-	}
-
 	// Always load aligned 64-bit value
 	auto& data = vm::_ref<const atomic_be_t<u64>>(addr & -8);
 	const u64 size_off = (sizeof(T) * 8) & 63;
@@ -3579,72 +3572,110 @@ namespace
 	std::array<u64, 4096> s_stcx_prev{};
 }
 
-static void ppu_stcx_release_campaign(ppu_thread& ppu) noexcept
+// A per-thread streak older than this is stale: the thread moved on (or the line stopped failing) and must not keep the SPU deny alive.
+static inline u64 ppu_stcx_streak_stale_tsc() noexcept
 {
-	const u32 line = ppu.stcx_streak_line;
-
-	if (!line)
-	{
-		return;
-	}
-
-	auto& e = s_stcx_fail[(line >> 7) & 4095];
-
-	if (e.addr.load() == line)
-	{
-		e.interest.release(0);
-		e.want_tsc.release(0);
-		e.streak.release(0);
-	}
-
-	ppu.stcx_streak = 0;
-	ppu.stcx_streak_line = 0;
+	static const u64 v = std::max<u64>(utils::get_tsc_freq() / 100, 1000); // ~10 ms
+	return v;
 }
 
-// play23: keep SPU deny alive across brief PPU sleeps (lwcond / usleep) by bumping
-// the campaign's last-activity tsc. Orphan decay still drops interest ~100ms after
-// the last fail or touch — no sticky-forever play14 wedge.
-static void ppu_stcx_touch_campaign_on_sleep(ppu_thread& ppu) noexcept
+// Slot of this thread's streak table for `line`, or nullptr.
+static inline ppu_thread::stcx_streak_slot* ppu_stcx_find_streak(ppu_thread& ppu, u32 line) noexcept
 {
-	const u32 line = ppu.stcx_streak_line;
-
-	if (!line)
+	for (auto& sl : ppu.stcx_streaks)
 	{
-		return;
+		if (sl.line == line)
+		{
+			return &sl;
+		}
 	}
 
-	auto& e = s_stcx_fail[(line >> 7) & 4095];
+	return nullptr;
+}
 
-	if (e.addr.load() == line && e.interest.load() != 0)
+// Consecutive recent failures of THIS thread on `line` (0 if none or stale).
+static inline u32 ppu_stcx_streak_of(ppu_thread& ppu, u32 line) noexcept
+{
+	if (auto* sl = ppu_stcx_find_streak(ppu, line))
 	{
-		const u64 now = utils::get_tsc();
-		e.tsc.release(now);
-		e.want_tsc.release(now);
+		if (utils::get_tsc() - sl->tsc <= ppu_stcx_streak_stale_tsc())
+		{
+			return sl->count;
+		}
+
+		sl->line = 0;
+		sl->count = 0;
+	}
+
+	return 0;
+}
+
+// play24: keep SPU deny alive across brief PPU sleeps (lwcond / usleep) for every line this thread is still actively retrying.
+// A streak older than ~10 ms is not refreshed, so a thread that gave up on a line cannot hold the SPUs off it forever (play20 zombies
+// softlock); the shared interest then decays on its own.
+static void ppu_stcx_touch_campaign_on_sleep(ppu_thread& ppu) noexcept
+{
+	const u64 now = utils::get_tsc();
+
+	for (auto& sl : ppu.stcx_streaks)
+	{
+		if (!sl.line || now - sl.tsc > ppu_stcx_streak_stale_tsc())
+		{
+			continue;
+		}
+
+		auto& e = s_stcx_fail[(sl.line >> 7) & 4095];
+
+		if (e.addr.load() == sl.line && e.interest.load() != 0)
+		{
+			e.tsc.release(now);
+			e.want_tsc.release(now);
+		}
 	}
 }
 
 static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 {
-	// Per-thread streak (drives the starvation refresh / lock wait). The shared per-line table below only feeds diagnostics and the SPU handoff.
-	if (ppu.stcx_streak_line == (addr & -128))
+	const u32 line = addr & -128;
+	const u64 now = utils::get_tsc();
+
+	// Per-thread, per-line streak (drives the starvation refresh / lock wait). The shared per-line table below only feeds diagnostics,
+	// the SPU handoff and the SPU deny.
+	auto* sl = ppu_stcx_find_streak(ppu, line);
+
+	if (!sl)
 	{
-		ppu.stcx_streak++;
-	}
-	else
-	{
-		// Switched lines: drop any campaign on the previous line before arming this one.
-		if (ppu.stcx_streak_line)
+		// New line: take a free slot, else the stalest one.
+		sl = &ppu.stcx_streaks[0];
+
+		for (auto& c : ppu.stcx_streaks)
 		{
-			ppu_stcx_release_campaign(ppu);
+			if (!c.line)
+			{
+				sl = &c;
+				break;
+			}
+
+			if (c.tsc < sl->tsc)
+			{
+				sl = &c;
+			}
 		}
 
-		ppu.stcx_streak_line = addr & -128;
-		ppu.stcx_streak = 1;
+		sl->line = line;
+		sl->count = 0;
+	}
+	else if (now - sl->tsc > ppu_stcx_streak_stale_tsc())
+	{
+		sl->count = 0;
 	}
 
+	sl->count++;
+	sl->tsc = now;
+
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
-	e.addr.release(addr & -128);
-	e.tsc.release(utils::get_tsc());
+	e.addr.release(line);
+	e.tsc.release(now);
 
 	if (++e.streak >= 8)
 	{
@@ -3659,8 +3690,12 @@ static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 
 static inline void note_stcx_ok(ppu_thread& ppu, u32 addr) noexcept
 {
-	ppu.stcx_streak = 0;
-	ppu.stcx_streak_line = 0;
+	// Only the line that succeeded is done; the other lines this thread is retrying keep their streaks.
+	if (auto* sl = ppu_stcx_find_streak(ppu, addr & -128))
+	{
+		sl->line = 0;
+		sl->count = 0;
+	}
 
 	auto& e = s_stcx_fail[(addr >> 7) & 4095];
 
@@ -3901,7 +3936,7 @@ static bool ppu_store_reservation(ppu_thread& ppu, u32 addr, u64 reg_value)
 	// one inside the 8-byte fetch_op, which alone accounted for ~8x more failures ('locked8') than this first check, so relaxing only
 	// this check (the first version) could never break the livelock. The data compare_exchange still guards the store itself, and
 	// a held line lock ((r & 127) != 0) still fails, so this is CAS semantics, not a free pass.
-	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu.stcx_streak >= stcx_adopt_streak && ppu.stcx_streak_line == (addr & -128);
+	const bool adopt_rtime = g_cfg.core.ppu_starvation_cas_refresh && old_data == data && ppu_stcx_streak_of(ppu, addr & -128) >= stcx_adopt_streak;
 
 	if (adopt_rtime && rtime != (res & -128))
 	{
