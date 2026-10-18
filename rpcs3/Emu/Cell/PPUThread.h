@@ -327,8 +327,17 @@ public:
 	u64 last_fail = 0;
 	// couchlink: consecutive stwcx./stdcx. failures of THIS thread on one 128-byte line (reset on this thread's own success).
 	// A per-line counter shared by all threads never reached the starvation threshold because other threads' successes reset it.
-	u32 stcx_streak = 0;
-	u32 stcx_streak_line = 0;
+	// Retry loops in BO2 alternate between two or more failing lines (CAS on line A, CAS on line B, usleep(50), repeat), so the streak is
+	// kept per line: a single (line, count) pair was reset by every switch and never reached the threshold (freeze 2026-10-12 23:03:
+	// 470k failures/10 s on two lines, starvation refreshes flat).
+	struct stcx_streak_slot
+	{
+		u32 line = 0;
+		u32 count = 0;
+		u64 tsc = 0; // TSC of the last failure on this line; a streak older than ~10 ms is stale
+	};
+
+	std::array<stcx_streak_slot, 4> stcx_streaks{};
 	u64 last_succ = 0;
 	u64 exec_bytes = 0; // Amount of "bytes" executed (4 for each instruction)
 
