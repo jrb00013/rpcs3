@@ -3579,6 +3579,21 @@ static inline u64 ppu_stcx_streak_stale_tsc() noexcept
 	return v;
 }
 
+// play25: how long a failing line keeps counting toward the starvation gate. The 10 ms window above is right for the SPU deny (a thread
+// that gave up must not hold SPUs off), but wrong for the gate itself. BO2 freeze 2026-10-19 (play24 live, ~525k failures/10 s on
+// 0x02e20880 + 0x02dfc480, 92% 'line-written' with unchanged data, starvation refreshes flat at ~1255 for 5 minutes): the starved
+// thread (Secondary: lwcond_queue_wait, 100 ms timeout) makes only a few stwcx. attempts per wake-up and then sleeps for tens of ms, so
+// its count was wiped by the 10 ms window before it could ever reach stcx_adopt_streak, while the SPURS kernels kept the line moving.
+// Failures on one line with no success on that line in the last ~1 s are one starvation episode, however the retries are spaced.
+static inline u64 ppu_stcx_adopt_window_tsc() noexcept
+{
+	static const u64 v = std::max<u64>(utils::get_tsc_freq(), 1000); // ~1 s
+	return v;
+}
+
+// Times a non-empty failure count expired before reaching the gate (diagnostic: should stay near 0 once play25 is active).
+static atomic_t<u64> g_stcx_streak_decays{};
+
 // Slot of this thread's streak table for `line`, or nullptr.
 static inline ppu_thread::stcx_streak_slot* ppu_stcx_find_streak(ppu_thread& ppu, u32 line) noexcept
 {
@@ -3598,7 +3613,7 @@ static inline u32 ppu_stcx_streak_of(ppu_thread& ppu, u32 line) noexcept
 {
 	if (auto* sl = ppu_stcx_find_streak(ppu, line))
 	{
-		if (utils::get_tsc() - sl->tsc <= ppu_stcx_streak_stale_tsc())
+		if (utils::get_tsc() - sl->tsc <= ppu_stcx_adopt_window_tsc())
 		{
 			return sl->count;
 		}
@@ -3665,8 +3680,13 @@ static inline void note_stcx_fail(ppu_thread& ppu, u32 addr) noexcept
 		sl->line = line;
 		sl->count = 0;
 	}
-	else if (now - sl->tsc > ppu_stcx_streak_stale_tsc())
+	else if (now - sl->tsc > ppu_stcx_adopt_window_tsc())
 	{
+		if (sl->count)
+		{
+			g_stcx_streak_decays++;
+		}
+
 		sl->count = 0;
 	}
 
@@ -3869,7 +3889,7 @@ u64 ppu_report_stcx_failures(std::string& out, u64 min_total, u32 top)
 
 	std::sort(hot.begin(), hot.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
-	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; commit-while-interest=%llu; starvation refreshes=%llu lock-waits=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_putllc_commit_while_interest.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
+	fmt::append(out, "stwcx./stdcx. failures since last report: %llu (SPU back-offs for PPU priority, total: %llu; PUTLLC denies=%llu; commit-while-interest=%llu; starvation refreshes=%llu lock-waits=%llu streak-decays=%llu; cumulative by cause: data-changed=%llu line-written=%llu locked8=%llu locked128=%llu addr-mismatch=%llu); hottest lines:", total, g_spu_ppu_prio_backoffs.load(), g_spu_ppu_prio_putllc_deny.load(), g_putllc_commit_while_interest.load(), g_stcx_refresh.load(), g_stcx_lockwait.load(), g_stcx_streak_decays.load(), g_stcx_fail_why[0].load(), g_stcx_fail_why[1].load(), g_stcx_fail_why[2].load(), g_stcx_fail_why[3].load(), g_stcx_fail_why[4].load());
 
 	for (u32 i = 0; i < top && i < hot.size(); i++)
 	{
