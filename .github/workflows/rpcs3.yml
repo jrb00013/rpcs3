@@ -491,6 +491,73 @@ jobs:
         shell: pwsh
         run: build\lib\Release-x64\rpcs3_test.exe
 
+      - name: Upload debug symbols (PDB)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 Windows MSVC PDB
+          path: ./bin/rpcs3.pdb
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Pack up build artifacts
+        run: |
+          mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          .ci/deploy-windows.sh
+
+      - name: Upload artifacts (7z)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 for Windows (MSVC)
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}
+          compression-level: 0
+          if-no-files-found: error
+
+      # couchlink: PR/branch builds used to skip cache save (master-only), so the fork never kept a
+      # warm MSVC ccache/deps. Save on every successful Windows job, and also upload both as artifacts
+      # so a local machine can `gh run download` them (Actions caches are not downloadable via gh).
+      - name: Upload Windows dependency cache
+        if: success()
+        uses: actions/upload-artifact@main
+        with:
+          name: Windows MSVC dependency cache
+          path: ${{ env.DEPS_CACHE_DIR }}
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: warn
+
+      - name: Upload Windows ccache
+        if: success()
+        uses: actions/upload-artifact@main
+        with:
+          name: Windows MSVC ccache
+          path: ${{ env.CCACHE_DIR }}
+          retention-days: 7
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Deploy master build to GitHub Releases
+        if: |
+          github.event_name != 'pull_request' &&
+          github.repository == 'RPCS3/rpcs3' &&
+          github.ref == 'refs/heads/master'
+        env:
+          RPCS3_TOKEN: ${{ secrets.RPCS3_TOKEN }}
+        run: .ci/github-upload.sh
+
+      - name: Save Build Ccache
+        if: success()
+        uses: actions/cache/save@main
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-build-ccache.outputs.cache-primary-key }}
+
+      - name: Save Dependencies Cache
+        if: success()
+        uses: actions/cache/save@main
+        with:
+          path: ${{ env.DEPS_CACHE_DIR }}
+          key: ${{ steps.restore-dependencies-cache.outputs.cache-primary-key }}
+
   Windows_Build_Clang:
     # Only run push event on master branch of main repo, but run all PRs
     needs: Clean_Code_Caches

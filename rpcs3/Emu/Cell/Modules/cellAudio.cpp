@@ -921,13 +921,13 @@ void cell_audio_thread::operator()()
 		}
 	};
 
-	u32 loop_count = 0;
+	// Backend (re)open back-off, in microseconds
+	u64 backend_retry_delay = 1'000'000;
+	u64 next_backend_retry = 0;
 
 	// Main cellAudio loop
 	while (thread_ctrl::state() != thread_state::aborting)
 	{
-		loop_count++;
-
 		const audio_backend_update update_req = m_update_configuration.observe();
 		if (update_req != audio_backend_update::NONE)
 		{
@@ -989,10 +989,25 @@ void cell_audio_thread::operator()()
 
 		bool operational = ringbuffer->get_operational_status();
 
-		if (!operational && loop_count % 128 == 0)
+		// Re-creating the backend takes the cellAudio mutex and enumerates audio devices, which can take
+		// hundreds of ms; game threads calling into cellAudio wait on that mutex. Retrying every ~0.7 s forever
+		// (e.g. configured device missing) stalled the game, so back off while the backend keeps failing.
+		if (operational)
+		{
+			backend_retry_delay = 1'000'000;
+			next_backend_retry = 0;
+		}
+		else if (timestamp >= next_backend_retry)
 		{
 			update_config(true);
 			operational = ringbuffer->get_operational_status();
+
+			if (!operational)
+			{
+				backend_retry_delay = std::min<u64>(backend_retry_delay * 2, 30'000'000);
+			}
+
+			next_backend_retry = get_system_time() + backend_retry_delay;
 		}
 
 		if (ringbuffer->device_changed())

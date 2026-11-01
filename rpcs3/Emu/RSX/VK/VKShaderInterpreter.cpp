@@ -850,6 +850,13 @@ namespace vk
 		min_variants_to_build *= ::size32(variants.base_pipelines);
 
 		// Drain the queue.
+		// A worker can stall inside the driver (observed: boot stuck at "Building base variant N of M" forever
+		// with idle CPU). Never let that block boot: give up when no variant completes for a long time.
+		// Anything not precompiled is built on demand by get() (inline link on cache miss), so this only costs warm-up.
+		constexpr auto stall_timeout = 30s;
+		u32 last_completed = 0;
+		auto last_progress = std::chrono::steady_clock::now();
+
 		do
 		{
 			std::this_thread::sleep_for(16ms);
@@ -863,6 +870,19 @@ namespace vk
 			{
 				min_variants_to_build = 0u;
 				dlg->enable_hold_to_skip();
+			}
+
+			const auto now = std::chrono::steady_clock::now();
+			if (completed != last_completed)
+			{
+				last_completed = completed;
+				last_progress = now;
+			}
+			else if (now - last_progress > stall_timeout)
+			{
+				rsx_log.error("Interpreter precompile stalled at %u of %u variants for %llus. Skipping the remainder; variants will be compiled on demand.",
+					completed, limit1, static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(stall_timeout).count()));
+				break;
 			}
 		}
 		while (ctr->load() < limit1 && thread_ctrl::state() != thread_state::aborting && !dlg->skip_requested());

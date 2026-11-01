@@ -109,6 +109,8 @@ protected:
 	std::map<hid_enumerated_device_type, std::wstring> m_enumerated_serials;
 	std::map<hid_enumerated_device_type, std::wstring> m_new_enumerated_serials;
 	std::mutex m_enumeration_mutex;
+	// Guards m_controllers and the Init()/update_devices() sequences (recursive: Init -> update_devices).
+	std::recursive_mutex m_devices_mutex;
 	std::unique_ptr<named_thread<std::function<void()>>> m_enumeration_thread;
 
 	void enumerate_devices();

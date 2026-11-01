@@ -1,0 +1,171 @@
+# Windows MSVC only — no Linux/Mac/FreeBSD/Clang matrix.
+# Use this for couchlink play builds where the only artifact that matters
+# is "RPCS3 for Windows (MSVC)" (+ PDB).
+#
+# Wall-clock cuts vs full "Build RPCS3":
+#   - no sibling runners (doesn't speed the MSVC VM, but frees quota / noise)
+#   - no Clean_Code_Caches gate
+#   - no unit tests
+#   - no 0.6–1.2GB cache *artifact* uploads (keep Actions cache save for next hit)
+#   - msbuild /m (all cores) + UseMultiToolTask
+#   - shallow checkout
+#
+# Concurrency is isolated so dispatching this does NOT cancel an in-flight
+# full-matrix "Build RPCS3" run on the same ref.
+name: Windows MSVC fast
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'play*'
+      - 'couchlink-play*'
+    paths:
+      - 'rpcs3/**'
+      - '3rdparty/**'
+      - 'buildfiles/**'
+      - '.ci/**'
+      - '.github/workflows/windows-msvc-fast.yml'
+      - 'rpcs3.sln'
+      - 'llvm.lock'
+
+concurrency:
+  group: windows-msvc-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_REPOSITORY_NAME: ${{ github.repository }}
+  BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+  BUILD_PR_NUMBER: ${{ github.event.pull_request.number }}
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+
+jobs:
+  Windows_MSVC:
+    name: RPCS3 Windows
+    runs-on: windows-2025-vs2026
+    env:
+      COMPILER: msvc
+      QT_VER_MAIN: '6'
+      QT_VER: '6.11.2'
+      QT_VER_MSVC: 'msvc2022'
+      QT_DATE: '202608131017'
+      LLVM_VER: '22.1.8'
+      VULKAN_VER: '1.4.341.1'
+      VULKAN_SDK_SHA: 'bcf2d75aa9556889ab974858666e20b3655b6055a0db704ccb47279ff33b5bfe'
+      CCACHE_SHA: '859141059ac950e1e8cd042c66f842f26b9e3a62a1669a69fe6ba180cb58bbdf'
+      CCACHE_BIN_DIR: 'C:\ccache_bin'
+      CCACHE_DIR: 'C:\ccache'
+      CCACHE_INODECACHE: 'true'
+      CCACHE_SLOPPINESS: 'time_macros'
+      CCACHE_LAUNCH_ARGS: '-DCMAKE_C_COMPILER_LAUNCHER=C:\ccache_bin\ccache.exe -DCMAKE_CXX_COMPILER_LAUNCHER=C:\ccache_bin\ccache.exe'
+      DEPS_CACHE_DIR: ./dependency_cache
+      UPLOAD_COMMIT_HASH: 7d09e3be30805911226241afbb14f8cdc2eb054e
+      UPLOAD_REPO_FULL_NAME: "RPCS3/rpcs3-binaries-win"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 1
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v4
+
+      - name: Restore NuGet packages
+        run: nuget restore rpcs3.sln
+
+      - name: Setup env
+        shell: pwsh
+        run: |
+          echo "QTDIR=C:\Qt\${{ env.QT_VER }}\${{ env.QT_VER_MSVC }}_64" >> ${{ github.env }}
+          echo "VULKAN_SDK=C:\VulkanSDK\${{ env.VULKAN_VER }}" >> ${{ github.env }}
+
+      - name: Get Cache Keys
+        run: .ci/get_keys-windows.sh
+
+      - name: Restore Build Ccache
+        uses: actions/cache/restore@main
+        id: restore-build-ccache
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: "${{ runner.os }}-ccache-${{ env.COMPILER }}-${{github.run_id}}"
+          restore-keys: ${{ runner.os }}-ccache-${{ env.COMPILER }}-
+
+      - name: Restore Dependencies Cache
+        uses: actions/cache/restore@main
+        id: restore-dependencies-cache
+        with:
+          path: ${{ env.DEPS_CACHE_DIR }}
+          key: "${{ runner.os }}-${{ env.COMPILER }}-${{ env.QT_VER }}-${{ env.VULKAN_SDK_SHA }}-${{ env.CCACHE_SHA }}-${{ hashFiles('llvm.lock') }}"
+          restore-keys: ${{ runner.os }}-${{ env.COMPILER }}-
+
+      - name: Download and unpack dependencies
+        run: |
+          .ci/setup-windows.sh
+          .ci/setup-windows-ci-vars.sh win64 msvc
+
+      - name: Export Variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ -z "$key" || "$key" =~ ^# ]] && continue
+            echo "$key=$val" >> "${{ github.env }}"
+          done < .ci/ci-vars.env
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@main
+
+      - name: Compile RPCS3
+        shell: pwsh
+        run: >
+          msbuild rpcs3.sln
+          /m
+          /p:Configuration=Release
+          /v:minimal
+          /p:Platform=x64
+          /p:PreferredToolArchitecture=x64
+          /p:MaxCpuCount=0
+          /p:CLToolPath=${{ env.CCACHE_BIN_DIR }}
+          /p:UseMultiToolTask=true
+          /p:EnforceProcessCountAcrossBuilds=true
+          /p:CustomAfterMicrosoftCommonTargets="${{ github.workspace }}\buildfiles\msvc\ci_only.targets"
+
+      - name: Upload debug symbols (PDB)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 Windows MSVC PDB
+          path: ./bin/rpcs3.pdb
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Pack up build artifacts
+        run: |
+          mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          .ci/deploy-windows.sh
+
+      - name: Upload artifacts (7z)
+        uses: actions/upload-artifact@main
+        with:
+          name: RPCS3 for Windows (MSVC)
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}
+          compression-level: 0
+          if-no-files-found: error
+
+      # Keep Actions cache warm for the next fast/full run. Do NOT re-upload
+      # multi-GB cache trees as downloadable artifacts (that was ~2–3 min).
+      - name: Save Build Ccache
+        if: success()
+        uses: actions/cache/save@main
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-build-ccache.outputs.cache-primary-key }}
+
+      - name: Save Dependencies Cache
+        if: success()
+        uses: actions/cache/save@main
+        with:
+          path: ${{ env.DEPS_CACHE_DIR }}
+          key: ${{ steps.restore-dependencies-cache.outputs.cache-primary-key }}

@@ -3485,6 +3485,26 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	return true;
 }
 
+// couchlink: hand the line to a starved PPU atomic (see ppu_stcx_wait_for_ppu in PPUThread.cpp). Always on: it only ever
+// does anything for a line where a PPU lwarx/stwcx. has failed >= 8 times in a row, and then for at most ~50 us per access.
+// Refusing PUTLLC's unique lock while the line is still wanted is gated by ppu_starvation_cas_refresh (BO2 opt-in) so MK cannot
+// regress: without that option the PPU does not adopt/wait, so denying SPU commits would only stall SPURS for no PPU gain.
+extern u32 ppu_stcx_wait_for_ppu(u32 addr);
+extern bool ppu_stcx_line_wanted(u32 addr);
+extern bool ppu_stcx_lock_waited(u32 addr);
+extern bool ppu_stcx_campaign_interest(u32 addr);
+extern atomic_t<u64> g_spu_ppu_prio_backoffs;
+extern atomic_t<u64> g_spu_ppu_prio_putllc_deny;
+extern atomic_t<u64> g_putllc_commit_while_interest;
+
+static inline void spu_yield_to_ppu_atomic(u32 addr) noexcept
+{
+	if (addr && ppu_stcx_wait_for_ppu(addr))
+	{
+		g_spu_ppu_prio_backoffs++;
+	}
+}
+
 bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 {
 	perf_meter<"PUTLLC-"_u64> perf0;
@@ -3527,14 +3547,41 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
+			// Refuse Accurate unchanged rtime+128 while a PPU retry campaign owns the line.
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				g_spu_ppu_prio_putllc_deny++;
+				return false;
+			}
+
 			// Writeback of unchanged data. Only check memory change
 			// For the comparison, load twice for atomicity
+			// play23: re-check wanted immediately before CAS (close commit-while-interest race).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				g_spu_ppu_prio_putllc_deny++;
+				return false;
+			}
+
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
 			{
+				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+				{
+					// Invariant breach: Accurate-unchanged deny must cover interest before this CAS.
+					g_putllc_commit_while_interest++;
+				}
+
 				raddr = 0; // Disable notification
 				return true;
 			}
 
+			return false;
+		}
+
+		// play22/23: refuse unique-lock PUTLLC while the line is wanted.
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
 			return false;
 		}
 
@@ -3557,6 +3604,15 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		if (!_ok)
 		{
 			// Already locked or updated: give up
+			return false;
+		}
+
+		// play23: PPU may have armed interest between the pre-lock deny and fetch_op.
+		// Abort without writing (release unique-lock via res += -64).
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			res += 0 - 64;
+			g_spu_ppu_prio_putllc_deny++;
 			return false;
 		}
 
@@ -3589,6 +3645,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// TODO: vm::check_addr
 			vm::writer_lock lock(addr, range_lock);
 
+			// play23: final gate under the writer lock before mutating the line.
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				return false;
+			}
+
 			if (cmp_rdata(rdata, super_data))
 			{
 				if (diff16_pos != umax)
@@ -3610,6 +3672,18 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		}();
 
 		res += success ? 64 : 0 - 64;
+
+		if (!success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+		}
+
+		// Protocol invariant: unique-lock commit must not land while interest is set.
+		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+		{
+			g_putllc_commit_while_interest++;
+		}
+
 		return success;
 	}())
 	{
@@ -4368,6 +4442,7 @@ bool spu_thread::process_mfc_cmd()
 		perf_meter<"GETLLAR"_u64> perf0;
 
 		const u32 addr = ch_mfc_cmd.eal & -128;
+		spu_yield_to_ppu_atomic(addr);
 		const auto& data = vm::_ref<spu_rdata_t>(addr);
 
 		if (addr == last_faddr)
@@ -4734,6 +4809,8 @@ bool spu_thread::process_mfc_cmd()
 
 	case MFC_PUTLLC_CMD:
 	{
+		spu_yield_to_ppu_atomic(raddr);
+
 		// Avoid logging useless commands if there is no reservation
 		const bool dump = g_cfg.core.mfc_debug && raddr;
 
