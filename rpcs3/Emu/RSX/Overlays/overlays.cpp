@@ -5,7 +5,9 @@
 #include "Emu/Io/interception.h"
 #include "Emu/Io/KeyboardHandler.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/emu_callbacks.h"
 #include "Emu/System.h"
+#include "Emu/system_config.h"
 
 LOG_CHANNEL(overlays);
 
@@ -39,7 +41,7 @@ namespace rsx
 
 		void play_sound(sound_effect sound, std::optional<f32> volume)
 		{
-			Emu.GetCallbacks().play_sound(get_sound_filepath(sound), volume);
+			g_emu_callbacks.play_sound(get_sound_filepath(sound), volume);
 		}
 
 		thread_local DECLARE(user_interface::g_thread_bit) = 0;
@@ -141,10 +143,15 @@ namespace rsx
 						}
 					}
 				}
-				else if (last_state && last_auto_repeat_button[pad_index] == button_id)
+				else if (last_state)
 				{
-					// We stopped pressing an auto-repeat button, so re-enable auto-repeat for other buttons.
-					last_auto_repeat_button[pad_index] = pad_button::pad_button_max_enum;
+					if (last_auto_repeat_button[pad_index] == button_id)
+					{
+						// We stopped pressing an auto-repeat button, so re-enable auto-repeat for other buttons.
+						last_auto_repeat_button[pad_index] = pad_button::pad_button_max_enum;
+					}
+
+					on_button_released(button_id);
 				}
 
 				last_state = pressed;
@@ -525,9 +532,9 @@ namespace rsx
 			}
 
 			if (auto rsxthr = rsx::get_current_renderer(); rsxthr &&
-				(min_refresh_duration_us + rsxthr->last_host_flip_timestamp) < get_system_time())
+				(min_refresh_duration_us + rsxthr->display_ctrl().get_last_host_flip_timestamp()) < get_system_time())
 			{
-				rsxthr->async_flip_requested |= rsx::thread::flip_request::native_ui;
+				rsxthr->display_ctrl().request_native_ui_flip();
 			}
 		}
 	} // namespace overlays

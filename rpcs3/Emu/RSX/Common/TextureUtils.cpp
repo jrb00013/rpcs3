@@ -821,10 +821,10 @@ std::vector<rsx::subresource_layout> get_subresources_layout_impl(
 }
 
 template<typename RsxTextureType>
-std::vector<rsx::subresource_layout> get_subresources_layout_impl(const RsxTextureType &texture)
+std::vector<rsx::subresource_layout> get_subresources_layout_impl(const rsx::context* ctx, const RsxTextureType &texture)
 {
 	const auto [h, depth, layer] = get_height_depth_layer(texture);
-	const u32 texaddr = rsx::get_address(texture.offset(), texture.location());
+	const u32 texaddr = rsx::get_address(ctx, texture.offset(), texture.location());
 
 	return get_subresources_layout_impl(
 		vm::_ptr<const std::byte>(texaddr),
@@ -864,14 +864,14 @@ namespace rsx
 			(texel_remap_control & GAMMA_CTRL_MASK) == GAMMA_RGB_MASK;
 	}
 
-	std::vector<rsx::subresource_layout> get_subresources_layout(const rsx::fragment_texture& texture)
+	std::vector<rsx::subresource_layout> get_subresources_layout(const rsx::context* ctx, const rsx::fragment_texture& texture)
 	{
-		return get_subresources_layout_impl(texture);
+		return get_subresources_layout_impl(ctx, texture);
 	}
 
-	std::vector<rsx::subresource_layout> get_subresources_layout(const rsx::vertex_texture& texture)
+	std::vector<rsx::subresource_layout> get_subresources_layout(const rsx::context* ctx, const rsx::vertex_texture& texture)
 	{
-		return get_subresources_layout_impl(texture);
+		return get_subresources_layout_impl(ctx, texture);
 	}
 
 	std::vector<rsx::subresource_layout> get_subresources_layout(const rsx::image_section_attributes_t& attrs, rsx::texture_dimension_extended type)
@@ -1502,6 +1502,24 @@ namespace rsx
 		}
 	}
 
+	bool is_float_depth_format(rsx::surface_depth_format2 format)
+	{
+		switch (format)
+		{
+		case rsx::surface_depth_format2::z16_float:
+		case rsx::surface_depth_format2::z24s8_float:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	f32 encode_emulated_depth(f32 depth)
+	{
+		// Halving the IEEE bit pattern of a non-negative float is monotonic and maps every finite value below 1
+		return std::bit_cast<f32>((std::bit_cast<u32>(std::max(depth, 0.f)) & 0x7fffffffu) >> 1);
+	}
+
 	/**
 	 * Returns number of texel lines decoded in one pitch-length number of bytes
 	 */
@@ -1827,9 +1845,45 @@ namespace rsx
 		}
 	}
 
-	u32 get_max_depth_value(rsx::surface_depth_format2 format)
+	f32 decode_e4m12(u32 value)
 	{
-		return get_format_block_size_in_bytes(format) == 2 ? 0xFFFF : 0xFFFFFF;
+		// Rebias by 2^111: unsigned E4M12 with bias 16, see E4M12Conversion.glsl
+		const uint bits = (value << 11) & 0x07FFF800u;
+		return std::bit_cast<f32>(bits) * std::bit_cast<f32>(0x77000000u);
+	}
+
+	f32 get_depth_clear_value(rsx::surface_depth_format2 format, u32 raw)
+	{
+		switch (format)
+		{
+		case rsx::surface_depth_format2::z16_uint:
+			return float(raw) / 0xFFFF;
+		case rsx::surface_depth_format2::z24s8_uint:
+			return float(raw) / 0xFFFFFF;
+		case rsx::surface_depth_format2::z16_float:
+			return decode_e4m12(raw);
+		case rsx::surface_depth_format2::z24s8_float:
+			return std::bit_cast<f32>(raw << 7);
+		default:
+				fmt::throw_exception("Unreachable");
+		}
+	}
+
+	// Hardware behaves as if each depth bound is converted into the surface's depth encoding, clamped to the format's range.
+	f32 clamp_depth_bounds_value(rsx::surface_depth_format2 format, f32 value)
+	{
+		switch (format)
+		{
+		case rsx::surface_depth_format2::z16_uint:
+		case rsx::surface_depth_format2::z24s8_uint:
+			return std::clamp(value, 0.f, 1.f);
+		case rsx::surface_depth_format2::z16_float:
+			return std::clamp(value, 0.f, decode_e4m12(0xFFFF));
+		case rsx::surface_depth_format2::z24s8_float:
+			return std::max(value, 0.f);
+		default:
+				fmt::throw_exception("Unreachable");
+		}
 	}
 
 	bool is_texcoord_wrapping_mode(rsx::texture_wrap_mode mode)

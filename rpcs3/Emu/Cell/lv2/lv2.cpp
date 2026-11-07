@@ -60,6 +60,7 @@
 #include "util/tsc.hpp"
 #include "util/sysinfo.hpp"
 #include "util/init_mutex.hpp"
+#include "util/cctype.hpp"
 
 #if defined(ARCH_X64)
 #ifdef _MSC_VER
@@ -72,11 +73,6 @@
 
 
 extern std::string ppu_get_syscall_name(u64 code);
-
-namespace rsx
-{
-	void set_rsx_yield_flag() noexcept;
-}
 
 using spu_rdata_t = decltype(spu_thread::rdata);
 extern u32 compute_rdata_hash32(const spu_rdata_t& _src);
@@ -1457,7 +1453,7 @@ std::string lv2_obj::name64(u64 name_u64)
 	// NTS string, ignore invalid/newline characters
 	// Example: "lv2\n\0tx" will be printed as "lv2"
 	std::string str{ptr, std::find(ptr, ptr + 7, '\0')};
-	str.erase(std::remove_if(str.begin(), str.end(), [](uchar c){ return !std::isprint(c); }), str.end());
+	str.erase(std::remove_if(str.begin(), str.end(), [](uchar c){ return !utils::isprint(c); }), str.end());
 
 	return str;
 }
@@ -1936,18 +1932,22 @@ bool lv2_obj::awake_unlocked(cpu_thread* cpu, s32 prio)
 	// While signaling to the other hardware thread to execute the caller's code.
 	// Resulting in a delay to the caller after such thread is signaled
 
-	if (current_ppu && changed_queue && has_free_hw_thread_space)
+	if (current_ppu && cpu != current_ppu && changed_queue && has_free_hw_thread_space)
 	{
 		if (current_ppu->prio.load().prio > lowest_new_priority)
 		{
-			const bool is_create_thread = current_ppu->gpr[11] == 0x35;
+			const bool is_create_thread = current_ppu->current_function && current_ppu->gpr[11] == 0x35;
 
 			// When not being set to All timers - activate only for sys_ppu_thread_start
 			if (is_create_thread || g_cfg.core.sleep_timers_accuracy == sleep_timers_accuracy_level::_all_timers)
 			{
 				if (!current_ppu->state.test_and_set(cpu_flag::yield) || current_ppu->hw_sleep_time != 0)
 				{
-					current_ppu->hw_sleep_time += (is_create_thread ? 51 : 35);
+#ifdef _WIN32
+					current_ppu->hw_sleep_time += (is_create_thread ? 600 : 200);
+#else
+					current_ppu->hw_sleep_time += 100;
+#endif
 				}
 				else
 				{
@@ -2093,7 +2093,7 @@ void lv2_obj::schedule_all(u64 current_time)
 			{
 				s_last_yield_tsc = tsc;
 				g_lv2_preempts_taken.release(g_lv2_preempts_taken.load() + 1); // Has a minor race but performance is more important
-				rsx::set_rsx_yield_flag();
+				rsx::yield_rsx_ctx_thread();
 			}
 		}
 	}
@@ -2412,7 +2412,7 @@ void lv2_obj::notify_all() noexcept
 	u32 notifies[total_waiters]{};
 	u64 notifies_time[total_waiters]{};
 
-	// There may be 6 waiters, but checking them all may be performance expensive 
+	// There may be 6 waiters, but checking them all may be performance expensive
 	// Instead, check 2 at max, but use the CPU ID index to tell which index to start checking so the work would be distributed across all threads
 
 	atomic_t<u64, 128>* range_lock = nullptr;
