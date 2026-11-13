@@ -3445,8 +3445,7 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 				return true;
 			}
 
-			// play20/21: refuse Accurate unchanged rtime+128 while a PPU retry campaign
-			// owns the line (event-driven interest / adopt waiters — not age-capped want).
+			// Refuse Accurate unchanged rtime+128 while a PPU retry campaign owns the line.
 			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
 			{
 				g_spu_ppu_prio_putllc_deny++;
@@ -3455,6 +3454,13 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 			// Writeback of unchanged data. Only check memory change
 			// For the comparison, load twice for atomicity
+			// play23: re-check wanted immediately before CAS (close commit-while-interest race).
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				g_spu_ppu_prio_putllc_deny++;
+				return false;
+			}
+
 			if (cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res == rtime && cmp_rdata(rdata, vm::_ref<spu_rdata_t>(addr)) && res.compare_and_swap_test(rtime, rtime + 128))
 			{
 				if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
@@ -3470,12 +3476,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			return false;
 		}
 
-		// play21: do NOT refuse unique-lock PUTLLC on campaign interest.
-		// play20 did, and zombies softlocked (freeze-zombies-play20): FPS stuck ~49.95,
-		// 0x2e20880 ~1.5–2M stwcx fails/10s, PUTLLC denies climbing, commit-while-interest
-		// to 1.4M+ (deny missed races) while locked8 dominated — SPUs and PPU deadlocked
-		// each other. Unique-lock commits are real progress; only Accurate-unchanged
-		// writebacks are the false-sharing storm we must block.
+		// play22/23: refuse unique-lock PUTLLC while the line is wanted.
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+			return false;
+		}
 
 		static const auto cast_as = [](void* ptr, usz pos){ return reinterpret_cast<u128*>(ptr) + pos; };
 		static const auto cast_as_const = [](const void* ptr, usz pos){ return reinterpret_cast<const u128*>(ptr) + pos; };
@@ -3496,6 +3502,15 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 		if (!_ok)
 		{
 			// Already locked or updated: give up
+			return false;
+		}
+
+		// play23: PPU may have armed interest between the pre-lock deny and fetch_op.
+		// Abort without writing (release unique-lock via res += -64).
+		if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			res += 0 - 64;
+			g_spu_ppu_prio_putllc_deny++;
 			return false;
 		}
 
@@ -3520,6 +3535,12 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 			// TODO: vm::check_addr
 			vm::writer_lock lock(addr, range_lock);
 
+			// play23: final gate under the writer lock before mutating the line.
+			if (g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+			{
+				return false;
+			}
+
 			if (cmp_rdata(rdata, super_data))
 			{
 				if (diff16_pos != umax)
@@ -3542,8 +3563,16 @@ bool spu_thread::do_putllc(const spu_mfc_cmd& args)
 
 		res += success ? 64 : 0 - 64;
 
-		// play21: unique-lock success while interest is allowed (see deny removal above).
-		// Do not treat it as commit-while-interest — that counter is Accurate-unchanged only.
+		if (!success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_line_wanted(addr))
+		{
+			g_spu_ppu_prio_putllc_deny++;
+		}
+
+		// Protocol invariant: unique-lock commit must not land while interest is set.
+		if (success && g_cfg.core.ppu_starvation_cas_refresh && ppu_stcx_campaign_interest(addr))
+		{
+			g_putllc_commit_while_interest++;
+		}
 
 		return success;
 	}())
