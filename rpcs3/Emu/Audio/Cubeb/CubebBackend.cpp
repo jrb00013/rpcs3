@@ -105,17 +105,26 @@ bool CubebBackend::Open(std::string_view dev_id, AudioFreq freq, AudioSampleSize
 	Close();
 	std::lock_guard lock{m_cb_mutex};
 
-	const bool use_default_device = dev_id.empty() || dev_id == audio_device_enumerator::DEFAULT_DEV_ID;
+	bool use_default_device = dev_id.empty() || dev_id == audio_device_enumerator::DEFAULT_DEV_ID;
 
 	if (use_default_device) Cubeb.notice("Trying to open default device");
 	else Cubeb.notice("Trying to open device with dev_id='%s'", dev_id);
 
 	device_handle device = GetDevice(use_default_device ? "" : dev_id);
 
+	if (!device.handle && !use_default_device)
+	{
+		// A configured device that no longer exists (driver reinstall, unplugged USB/HDMI sink, renamed
+		// endpoint) must not leave the game without audio: cellAudio would keep rebuilding the backend and
+		// the game's audio calls would stall behind it. Use the default device instead.
+		Cubeb.error("Device with id=%s not found, falling back to the default device", dev_id);
+		use_default_device = true;
+		device = GetDevice("");
+	}
+
 	if (!device.handle)
 	{
-		if (use_default_device) Cubeb.error("Opening default device failed");
-		else Cubeb.error("Device with id=%s not found", dev_id);
+		Cubeb.error("Opening default device failed");
 		return false;
 	}
 

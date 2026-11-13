@@ -11,8 +11,10 @@
 #include "Emu/RSX/Program/ShaderInterpreter.h"
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/localized_string.h"
+#include "Emu/RSX/Core/RSXContext.h"
 
 #include <thread>
+#include <unordered_set>
 
 namespace vk
 {
@@ -23,7 +25,6 @@ namespace vk
 	{
 		vk::pipeline_props m_properties{};
 		VkDevice m_device = VK_NULL_HANDLE;
-		VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
 		VkShaderModule m_vs = VK_NULL_HANDLE;
 		VkShaderModule m_fs = VK_NULL_HANDLE;
 
@@ -52,12 +53,10 @@ namespace vk
 		async_pipe_compiler_context(
 			const vk::pipeline_props& props,
 			VkDevice device,
-			VkPipelineCache pipeline_cache,
 			VkShaderModule vs,
 			VkShaderModule fs)
 			: m_properties(props)
 			, m_device(device)
-			, m_pipeline_cache(pipeline_cache)
 			, m_vs(vs)
 			, m_fs(fs)
 		{
@@ -459,12 +458,10 @@ namespace vk
 		return vk_prog;
 	}
 
-	void shader_interpreter::init(const vk::render_device& dev)
+	void shader_interpreter::init(rsx::context* ctx, const vk::render_device& dev)
 	{
+		m_ctx = ctx;
 		m_device = dev;
-
-		VkPipelineCacheCreateInfo drv_cache_info{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-		vkCreatePipelineCache(m_device, &drv_cache_info, nullptr, &m_driver_pipeline_cache);
 	}
 
 	void shader_interpreter::destroy()
@@ -473,12 +470,6 @@ namespace vk
 		m_program_cache.clear();
 		m_vs_shader_cache.clear();
 		m_fs_shader_cache.clear();
-
-		if (m_driver_pipeline_cache)
-		{
-			vkDestroyPipelineCache(m_device, m_driver_pipeline_cache, nullptr);
-			m_driver_pipeline_cache = VK_NULL_HANDLE;
-		}
 	}
 
 	std::shared_ptr<glsl::program> shader_interpreter::link(const vk::pipeline_props& properties, u64 compiler_opt, bool async, async_build_fn_callback async_callback)
@@ -486,7 +477,7 @@ namespace vk
 		auto vs = build_vs(compiler_opt);
 		auto fs = build_fs(compiler_opt);
 
-		async_pipe_compiler_context context{ properties, m_device, m_driver_pipeline_cache, vs->shader.get_handle(), fs->shader.get_handle() };
+		async_pipe_compiler_context context{ properties, m_device, vs->shader.get_handle(), fs->shader.get_handle() };
 		auto create_graphics_info_fn = [=]() mutable
 		{
 			return context.compile();
@@ -560,9 +551,9 @@ namespace vk
 		key.compiler_opt = 0;
 		key.properties = properties;
 
-		if (rsx::method_registers.alpha_test_enabled()) [[unlikely]]
+		if (fp_ctrl & RSX_SHADER_CONTROL_ALPHA_TEST) [[unlikely]]
 		{
-			switch (rsx::method_registers.alpha_func())
+			switch (m_ctx->draw_state.fragment_env.alpha_func)
 			{
 			case rsx::comparison_function::always:
 				break;
@@ -596,7 +587,7 @@ namespace vk
 		if (fp_metadata.referenced_textures_mask) key.compiler_opt |= COMPILER_OPT_ENABLE_TEXTURES;
 		if (fp_metadata.has_branch_instructions) key.compiler_opt |= COMPILER_OPT_ENABLE_FLOW_CTRL;
 		if (fp_metadata.has_pack_instructions) key.compiler_opt |= COMPILER_OPT_ENABLE_PACKING;
-		if (rsx::method_registers.polygon_stipple_enabled()) key.compiler_opt |= COMPILER_OPT_ENABLE_STIPPLING;
+		if (fp_ctrl & RSX_SHADER_CONTROL_POLYGON_STIPPLE) key.compiler_opt |= COMPILER_OPT_ENABLE_STIPPLING;
 		if (vp_ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) key.compiler_opt |= COMPILER_OPT_ENABLE_INSTANCING;
 		if (vp_metadata.referenced_textures_mask) key.compiler_opt |= COMPILER_OPT_ENABLE_VTX_TEXTURES;
 
@@ -726,32 +717,76 @@ namespace vk
 		std::vector<vk::pipeline_props> pipe_properties;
 		auto pdev = vk::get_current_renderer();
 
-		// Base pipeline - simple color
-		vk::pipeline_props base_props{};
-		base_props.state.set_attachment_count(1);
-		base_props.state.enable_cull_face(VK_CULL_MODE_BACK_BIT);
-		base_props.state.set_primitive_type(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-		base_props.state.set_color_mask(0, true, true, true, true);
-		base_props.state.set_attachment_count(1);
-		base_props.state.enable_depth_bias(true);
-		base_props.state.enable_depth_clamp(true);
-		base_props.state.enable_depth_bounds_test(pdev->get_depth_bounds_support());
-		base_props.renderpass_key = vk::get_renderpass_key(VK_FORMAT_B8G8R8A8_UNORM);
-		pipe_properties.push_back(base_props);
-
-		// Add in some blending
-		base_props.state.enable_blend(0,
-			VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-			VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-			VK_BLEND_OP_ADD, VK_BLEND_OP_ADD);
-		pipe_properties.push_back(base_props);
-
-		// Add a depth buffer
+		// Collect format information we intend to use.
+		// All formats to cover as many variants as possible
 		const auto depth_format = pdev->get_formats_support().d24_unorm_s8 ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
-		base_props.renderpass_key = vk::get_renderpass_key(VK_FORMAT_B8G8R8A8_UNORM, depth_format);
-		base_props.state.enable_depth_test(VK_COMPARE_OP_LESS);
-		base_props.state.set_depth_mask(true);
-		pipe_properties.push_back(base_props);
+		std::vector<VkFormat> possible_color_formats =
+		{
+			VK_FORMAT_B8G8R8A8_UNORM,
+			VK_FORMAT_R8G8B8A8_UNORM,
+			VK_FORMAT_R16G16B16A16_SFLOAT,
+			VK_FORMAT_R8G8_UNORM,
+			VK_FORMAT_R32_SFLOAT,
+			VK_FORMAT_R8_UNORM,
+
+			// These formats are so rarely used, we can skip them and not stutter so badly
+			// VK_FORMAT_R5G6B5_UNORM_PACK16,
+			// VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+			// VK_FORMAT_R32G32B32A32_SFLOAT,
+		};
+
+		// How many variants to generate before we allow the user to skip
+		u32 min_variants_to_build = 0u;
+
+		for (const auto surface_format : possible_color_formats)
+		{
+			// Base pipeline - simple color
+			vk::pipeline_props base_props{};
+			base_props.state.set_attachment_count(1);
+			base_props.state.enable_cull_face(VK_CULL_MODE_BACK_BIT);
+			base_props.state.set_primitive_type(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+			base_props.state.set_color_mask(0, true, true, true, true);
+			base_props.state.set_attachment_count(1);
+			base_props.state.enable_depth_bias(true);
+			base_props.state.enable_depth_clamp(true);
+			base_props.state.enable_depth_bounds_test(pdev->get_depth_bounds_support());
+			base_props.renderpass_key = vk::get_renderpass_key(surface_format);
+			pipe_properties.push_back(base_props);
+
+			// Add a depth buffer
+			base_props.renderpass_key = vk::get_renderpass_key(surface_format, depth_format);
+			base_props.state.enable_depth_test(VK_COMPARE_OP_LESS);
+			base_props.state.set_depth_mask(true);
+			pipe_properties.push_back(base_props);
+
+			// Add more targets. Typical G-buffers are 1-4 color targets + depth.
+			for (u8 index = 1; index < 4; ++index)
+			{
+				base_props.renderpass_key = vk::get_renderpass_key(surface_format, depth_format, index + 1);
+				base_props.state.set_attachment_count(index + 1);
+				base_props.state.set_color_mask(index, true, true, true, true);
+				pipe_properties.push_back(base_props);
+			}
+
+			// Add in some blending
+			if (surface_format != VK_FORMAT_R32G32B32A32_SFLOAT &&
+				surface_format != VK_FORMAT_R32_SFLOAT)
+			{
+				// Blending not supported for some F32 formats.
+				base_props.renderpass_key = vk::get_renderpass_key(surface_format, depth_format);
+				base_props.state.set_attachment_count(1);
+				base_props.state.enable_blend(0,
+					VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+					VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+					VK_BLEND_OP_ADD, VK_BLEND_OP_ADD);
+				pipe_properties.push_back(base_props);
+			}
+
+			if (!min_variants_to_build)
+			{
+				min_variants_to_build = ::size32(pipe_properties);
+			}
+		}
 
 		const auto variants = program_common::interpreter::get_interpreter_variants();
 		const u32 limit1 = ::size32(variants.base_pipelines) * ::size32(pipe_properties);
@@ -759,28 +794,66 @@ namespace vk
 		dlg->set_limit(0, limit1);
 		dlg->set_limit(1, limit2);
 
-		// Shared with the queued callbacks: if we give up waiting below, jobs that are
-		// still in flight must not write to a dead stack frame.
+		// Map each base pipeline to the full variants that can alias it
+		std::unordered_set<u64> base_opts;
+		for (const auto& variant : variants.base_pipelines)
+		{
+			base_opts.insert(variant.first | variant.second);
+		}
+
+		std::unordered_map<u64, std::vector<u64>> variant_map;
+		for (const auto& variant : variants.pipelines)
+		{
+			const u64 compat_opt = variant.vs_opts.compatible_shader_opts | variant.fs_opts.compatible_shader_opts;
+			const u64 exact_opt = variant.vs_opts.shader_opt | variant.fs_opts.shader_opt;
+
+			if (!base_opts.contains(compat_opt))
+			{
+				fmt::throw_exception("Invalid interpreter configuration.");
+			}
+
+			if (compat_opt != exact_opt)
+			{
+				variant_map[compat_opt].push_back(exact_opt);
+			}
+		}
+
 		auto ctr = std::make_shared<atomic_t<u32>>(0);
 		for (const auto& props : pipe_properties)
 		{
 			for (auto& variant : variants.base_pipelines)
 			{
-				pipeline_key key{};
-				key.properties = props;
-				key.compiler_opt = variant.first | variant.second;
+				const u64 base_opt = variant.first | variant.second;
+				const auto found = variant_map.find(base_opt);
+				auto derived_opts = found != variant_map.end() ? found->second : std::vector<u64>{};
 
-				link(props, variant.first | variant.second, true, [ctr](std::shared_ptr<glsl::program>&) { (*ctr)++; });
+				// The callback runs under m_program_cache_lock and may outlive this function if the user skips
+				link(props, base_opt, true, [this, ctr, props, derived_opts = std::move(derived_opts)](std::shared_ptr<glsl::program>& prog)
+				{
+					pipeline_key key{};
+					key.properties = props;
+
+					for (const u64 opt : derived_opts)
+					{
+						// Never replace an existing entry, it is either the same alias or a real pipeline
+						key.compiler_opt = opt;
+						m_program_cache.try_emplace(key, pipeline_cache_entry_t{ .flags = CACHED_PIPE_UNOPTIMIZED, .program = prog });
+					}
+
+					(*ctr)++;
+				});
 			}
 		}
 
+		// It doesn't need to be exact but at least generate enough to cover most of the base pipelines.
+		// Even if we miss the pipelines, the driver already saw them, so processing will be fast.
+		min_variants_to_build *= ::size32(variants.base_pipelines);
+
 		// Drain the queue.
-		// FIXME: Since the queue is executing from the context of the pipe compiler, we cannot properly stop this process.
-		// A worker can stall inside the driver (observed: boot stuck at "Building base variant N of M" forever with idle CPU).
-		// Never let that block boot: give up when no variant completes for a long time. Anything not
-		// precompiled is built on demand by get() (inline link on cache miss), so this only costs warm-up.
+		// A worker can stall inside the driver (observed: boot stuck at "Building base variant N of M" forever
+		// with idle CPU). Never let that block boot: give up when no variant completes for a long time.
+		// Anything not precompiled is built on demand by get() (inline link on cache miss), so this only costs warm-up.
 		constexpr auto stall_timeout = 30s;
-		bool precompile_complete = true;
 		u32 last_completed = 0;
 		auto last_progress = std::chrono::steady_clock::now();
 
@@ -792,6 +865,13 @@ namespace vk
 			dlg->update_msg(0, get_localized_string(localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_VULKAN, "%u %s %u", completed, get_localized_string(localized_string_id::PROGRESS_DIALOG_OF), limit1));
 			dlg->set_value(0, completed);
 
+			if (min_variants_to_build &&
+				completed >= min_variants_to_build)
+			{
+				min_variants_to_build = 0u;
+				dlg->enable_hold_to_skip();
+			}
+
 			const auto now = std::chrono::steady_clock::now();
 			if (completed != last_completed)
 			{
@@ -802,50 +882,10 @@ namespace vk
 			{
 				rsx_log.error("Interpreter precompile stalled at %u of %u variants for %llus. Skipping the remainder; variants will be compiled on demand.",
 					completed, limit1, static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(stall_timeout).count()));
-				precompile_complete = false;
 				break;
 			}
 		}
-		while (ctr->load() < limit1);
-
-		std::lock_guard lock(m_program_cache_lock);
-
-		for (const auto& props : pipe_properties)
-		{
-			pipeline_key base_key;
-			base_key.properties = props;
-
-			for (auto& variant : variants.pipelines)
-			{
-				// Check if we have an exact match
-				base_key.compiler_opt = variant.vs_opts.shader_opt | variant.fs_opts.shader_opt;
-				if (auto found = m_program_cache.find(base_key);
-					found != m_program_cache.end())
-				{
-					// We have a perfect match, no propagation required
-					continue;
-				}
-
-				// Find a compatible pipeline
-				auto compat_key = base_key;
-				compat_key.compiler_opt = variant.vs_opts.compatible_shader_opts | variant.fs_opts.compatible_shader_opts;
-				auto found = m_program_cache.find(compat_key);
-
-				if (found == m_program_cache.end())
-				{
-					// Only legitimate if the precompile above was cut short. Otherwise the variant set is inconsistent.
-					ensure(!precompile_complete, "Invalid interpreter configuration.");
-					continue;
-				}
-
-				pipeline_cache_entry_t cache_entry
-				{
-					.flags = CACHED_PIPE_UNOPTIMIZED,
-					.program = found->second.program
-				};
-				m_program_cache[base_key] = cache_entry;
-			}
-		}
+		while (ctr->load() < limit1 && thread_ctrl::state() != thread_state::aborting && !dlg->skip_requested());
 
 		dlg->set_value(1, limit2);
 		dlg->refresh();

@@ -279,7 +279,6 @@ public:
 
 	atomic_t<ppu_prio_t> prio{};
 
-	// Backported unchanged from upstream (needed by f9b4d121 sys_cond_signal_to fix)
 	bool is_lower_priority_than(ppu_thread& other) const
 	{
 		return prio.load().prio < other.prio.load().prio;
@@ -289,11 +288,13 @@ public:
 	{
 		return prio.load().prio < _prio;
 	}
+
 	const u32 stack_size; // Stack size
 	const u32 stack_addr; // Stack address
 
 	atomic_t<ppu_join_status> joiner; // Joining thread or status
 	u32 hw_sleep_time = 0; // Very specific delay for hardware threads switching, see lv2_obj::awake_unlocked for more details
+	u64 event_wakeup_time = 0;
 
 	lf_fifo<atomic_t<cmd64>, 127> cmd_queue; // Command queue for asynchronous operations.
 
@@ -303,6 +304,8 @@ public:
 	cmd64 cmd_wait(); // Empty command means caller must return, like true from cpu_thread::check_status().
 	cmd64 cmd_get(u32 index) { return cmd_queue[cmd_queue.peek() + index].load(); }
 	atomic_t<u32> cmd_notify = 0;
+
+	atomic_t<u32> start_gate_caller = 0; // Caller of sys_ppu_thread_start waiting for this thread to reach its entry command, cleared by this thread
 
 	alignas(64) const ppu_func_opd_t entry_func;
 	u64 start_time{0}; // Sleep start timepoint
@@ -327,8 +330,17 @@ public:
 	u64 last_fail = 0;
 	// couchlink: consecutive stwcx./stdcx. failures of THIS thread on one 128-byte line (reset on this thread's own success).
 	// A per-line counter shared by all threads never reached the starvation threshold because other threads' successes reset it.
-	u32 stcx_streak = 0;
-	u32 stcx_streak_line = 0;
+	// Retry loops in BO2 alternate between two or more failing lines (CAS on line A, CAS on line B, usleep(50), repeat), so the streak is
+	// kept per line: a single (line, count) pair was reset by every switch and never reached the threshold (freeze 2026-10-12 23:03:
+	// 470k failures/10 s on two lines, starvation refreshes flat).
+	struct stcx_streak_slot
+	{
+		u32 line = 0;
+		u32 count = 0;
+		u64 tsc = 0; // TSC of the last failure on this line; a streak older than ~10 ms is stale
+	};
+
+	std::array<stcx_streak_slot, 4> stcx_streaks{};
 	u64 last_succ = 0;
 	u64 exec_bytes = 0; // Amount of "bytes" executed (4 for each instruction)
 

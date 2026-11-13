@@ -13,9 +13,9 @@
 #include "hex_validator.h"
 
 #include "Emu/System.h"
+#include "Emu/system_config.h"
 #include "Emu/IdManager.h"
 #include "Emu/RSX/RSXThread.h"
-#include "Emu/RSX/RSXDisAsm.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/PPUDisAsm.h"
@@ -688,7 +688,7 @@ void debugger_frame::keyPressEvent(QKeyEvent* event)
 			{
 				if (cpu->get_class() == thread_class::rsx)
 				{
-					if (u32 addr = static_cast<rsx::thread*>(cpu)->label_addr)
+					if (u32 addr = static_cast<rsx::thread*>(cpu)->get_context()->fw.label_addr)
 					{
 						// Memory viewer pointing to RSX semaphores
 						idm::make<memory_viewer_handle>(this, m_disasm, addr, make_check_cpu(nullptr));
@@ -826,7 +826,7 @@ cpu_thread* debugger_frame::get_cpu()
 		}
 	}
 
-	if (!!m_disasm != !!m_cpu)
+	if (!!m_disasm != !!m_cpu && !m_rsx)
 	{
 		// Fixup for HW PPU viewer
 		if (m_cpu)
@@ -1403,7 +1403,7 @@ void debugger_frame::OnSelectSPUDisassembler()
 
 		for (u32 passed = spu_base; passed < SPU_LS_SIZE; passed += 4096)
 		{
-			if (!vm::check_addr(spu_addr + passed))
+			if (!vm::check_addr(spu_addr + passed - spu_base))
 			{
 				if (passed == spu_base)
 				{
